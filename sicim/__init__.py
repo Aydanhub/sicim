@@ -1,0 +1,57 @@
+"""sicim — durable agent runtime.
+
+Deterministic replay, checkpoint resume and saga-style compensation for
+long-running (LLM agent) workflows. Zero runtime dependencies.
+"""
+
+from .context import WorkflowContext
+from .errors import (
+    CompensationFailed,
+    NonDeterminismError,
+    NonRetryable,
+    RunNotFound,
+    SerializationError,
+    SicimError,
+    StepFailed,
+    WaitTimeout,
+    WorkflowCancelled,
+    WorkflowFailed,
+    WorkflowNotFound,
+)
+from .journal import Event, Kind
+from .retry import NO_RETRY, RetryPolicy
+from .runtime import RunHandle, Runtime
+from .store import InMemoryStore, RunRecord, RunStatus, SignalRecord, SQLiteStore, Store
+from .workflow import get_workflow, workflow
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "CompensationFailed",
+    "Event",
+    "InMemoryStore",
+    "Kind",
+    "NO_RETRY",
+    "NonDeterminismError",
+    "NonRetryable",
+    "RetryPolicy",
+    "RunHandle",
+    "RunNotFound",
+    "RunRecord",
+    "RunStatus",
+    "Runtime",
+    "SQLiteStore",
+    "SerializationError",
+    "SicimError",
+    "SignalRecord",
+    "StepFailed",
+    "Store",
+    "WaitTimeout",
+    "WorkflowCancelled",
+    "WorkflowContext",
+    "WorkflowFailed",
+    "WorkflowNotFound",
+    "get_workflow",
+    "workflow",
+    "__version__",
+]
