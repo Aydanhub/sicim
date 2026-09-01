@@ -22,10 +22,13 @@ import logging
 import uuid
 from typing import Any
 
+from typing import Callable
+
 from . import serde
 from .context import WorkflowContext
 from .errors import (
     CompensationFailed,
+    LeaseUnavailable,
     NonDeterminismError,
     RunNotFound,
     SicimError,
@@ -35,7 +38,7 @@ from .errors import (
 from .journal import Event, Journal, Kind
 from .retry import RetryPolicy
 from .store import InMemoryStore, RunRecord, RunStatus, SignalRecord, Store
-from .workflow import WorkflowFn, get_workflow, workflow_name
+from .workflow import WorkflowFn, get_workflow, workflow_name, workflow_version
 
 logger = logging.getLogger("sicim")
 
@@ -87,11 +90,37 @@ class RunHandle:
 
 
 class Runtime:
-    """Drives workflow runs against a Store."""
+    """Drives workflow runs against a Store.
 
-    def __init__(self, store: Store | None = None, *, default_retry: RetryPolicy | None = None):
+    Each Runtime is a *worker*: before driving a run it acquires that run's
+    lease (renewed by a heartbeat at ``lease_ttl / 3``), so several workers can
+    safely share one store — a run is only ever driven by one of them, and a
+    crashed worker's runs become claimable once its leases expire.
+
+    ``signal_poll_interval`` bounds how long a waiting run goes without
+    re-scanning its signal inbox; it only matters for signals sent by another
+    worker (in-process signals wake the run immediately).
+
+    ``on_event`` is an observability hook called as ``on_event(run_id, event)``
+    after every journal append; exceptions it raises are logged and ignored.
+    """
+
+    def __init__(
+        self,
+        store: Store | None = None,
+        *,
+        default_retry: RetryPolicy | None = None,
+        worker_id: str | None = None,
+        lease_ttl: float = 30.0,
+        signal_poll_interval: float = 1.0,
+        on_event: Callable[[str, Event], None] | None = None,
+    ):
         self.store = store or InMemoryStore()
         self.default_retry = default_retry or RetryPolicy()
+        self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
+        self.lease_ttl = lease_ttl
+        self.signal_poll_interval = signal_poll_interval
+        self.on_event = on_event
         self._handles: dict[str, RunHandle] = {}
         self._waiters: dict[str, set[asyncio.Future]] = {}
         self._cancel_flags: dict[str, bool] = {}
@@ -117,6 +146,7 @@ class Runtime:
         record = RunRecord(
             run_id=run_id,
             workflow=name,
+            version=workflow_version(wf),
             args=serde.roundtrip(list(args)) or [],
             kwargs=serde.roundtrip(kwargs) or {},
         )
@@ -130,9 +160,18 @@ class Runtime:
         return await self._ensure(record)
 
     async def recover(self) -> list[RunHandle]:
-        """Resume every incomplete run in the store. Call this on process start."""
+        """Resume every claimable incomplete run in the store.
+
+        Runs leased by another live worker are skipped; they become claimable
+        here once that worker releases them or its lease expires.
+        """
         records = await self.store.list_runs(status=RunStatus.RUNNING)
-        handles = [await self._ensure(record) for record in records]
+        handles = []
+        for record in records:
+            try:
+                handles.append(await self._ensure(record))
+            except LeaseUnavailable:
+                logger.debug("[%s] leased elsewhere; skipping recover", record.run_id)
         if handles:
             logger.info("recovered %d incomplete run(s)", len(handles))
         return handles
@@ -146,7 +185,10 @@ class Runtime:
         await self.store.append_signal(run_id, name, payload)
         handle = self._handles.get(run_id)
         if handle is None or handle.done():
-            await self._ensure(record)
+            try:
+                await self._ensure(record)
+            except LeaseUnavailable:
+                pass  # another worker drives it; its inbox poll picks the signal up
         self._wake(run_id)
 
     async def cancel(self, run_id: str) -> None:
@@ -163,7 +205,10 @@ class Runtime:
         handle = self._handles.get(run_id)
         if handle is None or handle.done():
             record.cancel_requested = True
-            await self._ensure(record)
+            try:
+                await self._ensure(record)
+            except LeaseUnavailable:
+                pass  # the driving worker sees the persisted flag via its heartbeat
         self._wake(run_id)
 
     async def status(self, run_id: str) -> RunRecord:
@@ -211,11 +256,18 @@ class Runtime:
                 return handle
             if record.status.terminal:
                 return RunHandle(record.run_id, record=record)
+            if not await self.store.try_acquire_lease(record.run_id, self.worker_id, self.lease_ttl):
+                lease = await self.store.load_lease(record.run_id)
+                raise LeaseUnavailable(record.run_id, lease[0] if lease else None)
             wf = get_workflow(record.workflow)
             events = await self.store.load_events(record.run_id)
-            journal = Journal(record.run_id, self.store, events)
+            journal = Journal(record.run_id, self.store, events, on_append=self.on_event)
             ctx = WorkflowContext(
-                run_id=record.run_id, workflow_name=record.workflow, runtime=self, journal=journal
+                run_id=record.run_id,
+                workflow_name=record.workflow,
+                runtime=self,
+                journal=journal,
+                version=record.version,
             )
             self._cancel_flags[record.run_id] = record.cancel_requested
             if record.cancel_requested:
@@ -242,6 +294,9 @@ class Runtime:
         replaying = journal.max_op_id >= 0
         if replaying:
             logger.info("[%s] resuming '%s' (replaying %d events)", run_id, record.workflow, len(journal.events))
+        heartbeat = asyncio.create_task(
+            self._heartbeat(run_id, asyncio.current_task()), name=f"sicim-lease:{run_id}"
+        )
         try:
             await journal.append_once(
                 Kind.RUN_STARTED, -1, {"workflow": record.workflow, "args": serde.preview(record.args)}
@@ -304,6 +359,34 @@ class Runtime:
         finally:
             self._cancel_flags.pop(run_id, None)
             self._cancel_events.pop(run_id, None)
+            heartbeat.cancel()
+            with contextlib.suppress(BaseException):
+                await heartbeat
+            # Graceful handover; after a hard crash the TTL expiry covers this.
+            with contextlib.suppress(BaseException):
+                await self.store.release_lease(run_id, self.worker_id)
+
+    async def _heartbeat(self, run_id: str, driver: asyncio.Task) -> None:
+        """Renew the run's lease and mirror cross-worker state while driving it.
+
+        Losing the lease (another worker took over after an expiry) stops the
+        driver crash-equivalently: no state is written, the run stays with the
+        new owner. A ``cancel_requested`` flag persisted by another worker is
+        picked up here and turned into local cooperative cancellation.
+        """
+        interval = max(self.lease_ttl / 3.0, 0.05)
+        while True:
+            await asyncio.sleep(interval)
+            if not await self.store.renew_lease(run_id, self.worker_id, self.lease_ttl):
+                logger.error("[%s] lease lost; stopping driver (run stays RUNNING)", run_id)
+                driver.cancel()
+                return
+            if not self._cancel_flags.get(run_id, False):
+                record = await self.store.load_run(run_id)
+                if record is not None and record.cancel_requested:
+                    self._cancel_flags[run_id] = True
+                    self._cancel_event(run_id).set()
+                    self._wake(run_id)
 
     # -- hooks used by WorkflowContext ---------------------------------------
 

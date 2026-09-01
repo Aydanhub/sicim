@@ -18,6 +18,11 @@ Temel ilke: **kod, yapının kaynağıdır; journal, sonuçların kaynağıdır.
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'   # Python >= 3.11
 ```
 
+> Not: Proje iCloud'a senkronlanan bir dizindeyse (Desktop/Documents), macOS senkron
+> servisi venv dosyalarına `hidden` bayrağı basabilir ve Python 3.13 gizli `.pth`
+> dosyalarını atladığı için editable kurulum kırılır. Çözüm: venv'i dışarıda tutun —
+> `python -m venv ~/.venvs/sicim && ln -s ~/.venvs/sicim .venv`.
+
 ## Hızlı başlangıç
 
 ```python
@@ -114,6 +119,54 @@ a, b, c = await ctx.gather(ctx.step(f1), ctx.step(f2), ctx.step(f3))
 
 Operasyon kimlikleri `ctx.step(...)` *çağrıldığı anda* (senkron, kod sırasıyla) atandığı için paralel dallar replay'de de kararlıdır.
 
+### Child workflow'lar
+
+```python
+@sicim.workflow
+async def research_agent(ctx, question):
+    plan = await ctx.step(llm, "plan", question)
+    reports = await ctx.gather(
+        *(ctx.child(sub_agent, topic) for topic in plan["topics"])
+    )
+    return await ctx.step(llm, "synthesize", reports)
+```
+
+`ctx.child(wf, ...)` kayıtlı başka bir workflow'u **kendi journal'ına sahip bağımsız bir run** olarak başlatır ve sonucunu bekler — agent/sub-agent hiyerarşileri için. Çocuğun run id'si deterministiktir (`<parent>.c<op>`), bu yüzden çökme sonrası replay çocuğu yeniden başlatmaz, mevcut run'a yeniden bağlanır; ebeveyn ve çocuk bağımsız devam eder. Çocuğun terminal hatası ebeveynde `sicim.ChildFailed` fırlatır (yakalanabilir); çocuğu beklerken ebeveyn iptal edilirse çocuk da iptal edilir ve kendi telafilerini koşar. `compensate=` adımlardaki gibi çalışır.
+
+### Çoklu worker ve lease
+
+Her `Runtime` bir *worker*'dır: bir run'ı sürmeden önce onun kirasını (lease) alır ve `lease_ttl / 3` aralıklı heartbeat ile yeniler. Aynı store'u birden çok worker güvenle paylaşır:
+
+- `recover()` başka worker'ın kiraladığı run'ları çalmaz, atlar; `start`/`resume` ise `LeaseUnavailable` fırlatır.
+- Bir worker ölürse kiraları TTL sonunda düşer ve run'ları başka worker tarafından devralınır; `shutdown()` kiraları hemen bırakır (hızlı devir).
+- Başka worker'ın sürdüğü run'a `signal()` gönderilebilir: sinyal store'a kuyruklanır, bekleyen run `signal_poll_interval` (varsayılan 1 sn) içinde alır. `cancel()` de aynı şekilde çalışır: bayrak store'a yazılır, süren worker heartbeat'inde görüp kooperatif iptali başlatır.
+
+```python
+rt = sicim.Runtime(store, worker_id="api-1", lease_ttl=30.0, signal_poll_interval=1.0)
+```
+
+### Versiyonlama
+
+Uçuştaki run'ları kırmadan workflow kodunu evrimleştirmek için versiyon sabitleme:
+
+```python
+@sicim.workflow(name="order_flow", version=2)
+async def order_flow(ctx, order_id):
+    if ctx.version >= 2:
+        await ctx.step(new_fraud_check, order_id)   # yalnız yeni run'lar
+    ...
+```
+
+Versiyon run başlarken kayda yazılır ve **run ömrü boyunca sabittir**: v1 ile başlamış bir run, v2 kodu deploy edildikten sonra devam ettirildiğinde `ctx.version == 1` görür ve eski dalı izler — journal'la uyum bozulmaz. Eski dalları, o versiyondaki tüm run'lar bitince silebilirsiniz.
+
+### Gözlemlenebilirlik
+
+```python
+rt = sicim.Runtime(store, on_event=lambda run_id, event: metrics.emit(run_id, event.kind))
+```
+
+Her journal append'inde çağrılır; hook'un fırlattığı hatalar loglanır ve run'ı asla etkilemez.
+
 ### İptal
 
 `rt.cancel(run_id)` **kooperatiftir**: run bir sonraki *canlı* operasyon sınırında durur (asla replay'in veya bir adımın ortasında değil), telafilerini koşar ve `CANCELLED` biter. Uçuştaki bir adımın bitmesi beklenir — sınırlamak için adım `timeout=`'u kullanın.
@@ -135,16 +188,16 @@ Workflow **gövdesi** için (adımlar için değil):
 
 | Öğe | Ne yapar |
 |---|---|
-| `@sicim.workflow` / `@sicim.workflow(name=...)` | `async def` fonksiyonu workflow olarak kaydeder |
-| `Runtime(store, default_retry=...)` | Sürücü; `InMemoryStore()` varsayılan |
+| `@sicim.workflow` / `@sicim.workflow(name=..., version=N)` | `async def` fonksiyonu workflow olarak kaydeder; versiyon run'a sabitlenir |
+| `Runtime(store, default_retry=, worker_id=, lease_ttl=, signal_poll_interval=, on_event=)` | Worker; `InMemoryStore()` varsayılan |
 | `rt.start(wf, *args, run_id=...)` | Run başlatır (`run_id` üzerinde idempotent) → `RunHandle` |
-| `rt.recover()` / `rt.resume(run_id)` | Yarım run'ları replay edip devam ettirir |
-| `rt.signal(run_id, name, payload)` | Olay teslim eder (gerekirse run'ı uyandırır) |
-| `rt.cancel(run_id)` | Kooperatif iptal + telafiler |
+| `rt.recover()` / `rt.resume(run_id)` | Yarım run'ları replay edip devam ettirir (kiralılar: atla / `LeaseUnavailable`) |
+| `rt.signal(run_id, name, payload)` | Olay teslim eder (gerekirse run'ı uyandırır; worker'lar arası çalışır) |
+| `rt.cancel(run_id)` | Kooperatif iptal + telafiler (worker'lar arası çalışır) |
 | `rt.status(run_id)` / `rt.events(run_id)` | Run kaydı / journal |
-| `rt.shutdown()` | Çökme-eşdeğeri durdurma |
+| `rt.shutdown()` | Çökme-eşdeğeri durdurma (kiraları bırakır) |
 | `await handle` / `handle.result()` | Sonuç, ya da `WorkflowFailed` / `WorkflowCancelled` / `CompensationFailed` / `NonDeterminismError` |
-| `ctx.step / sleep / wait_event / now / random / uuid4 / gather / add_compensation / log / is_replaying` | Workflow içi API |
+| `ctx.step / child / sleep / wait_event / now / random / uuid4 / gather / add_compensation / log / is_replaying / version` | Workflow içi API |
 
 Run durumları: `RUNNING → COMPLETED | FAILED | CANCELLED | COMPENSATION_FAILED`.
 
@@ -163,9 +216,10 @@ python -m sicim --db sicim.db show <run_id>    # run kaydı + journal + sinyalle
 .venv/bin/pytest -q                          # tüm senaryolar iki backend'de de koşar
 ```
 
-## v0.1 kısıtları ve yol haritası
+## v0.2 kısıtları ve yol haritası
 
-- Tek süreç varsayımı: aynı run'ı aynı anda tek Runtime sürmeli (lease/lock yok). Yol haritası: çalışan kilidi, çoklu worker.
 - Sinyal, var olmayan run'a gönderilemez (önce `start`).
 - Retry backoff *bekleyişi* journal'lanmaz (deneme sayısı journal'lanır); çökme sonrası sıradaki deneme hemen yapılır.
-- Yol haritası: child workflow'lar, `ctx.patched()` ile kod versiyonlama, journal sıkıştırma/arşivleme, Postgres store, gözlemlenebilirlik hook'ları.
+- Lease devralma TTL çözünürlüğündedir: ölen worker'ın run'ı en fazla `lease_ttl` sonra devralınır.
+- Ebeveyn *başarısız olduğunda* (iptal değil), o an `gather` içinde koşan çocuklar bağımsız devam eder — gerekirse telafide `cancel` edin.
+- Yol haritası: journal sıkıştırma / continue-as-new (sonsuz döngülü agent'lar için), Postgres store, sinyal aboneliği (poll yerine push), OpenTelemetry entegrasyonu.

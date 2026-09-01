@@ -21,25 +21,36 @@ WorkflowFn = Callable[..., Coroutine[Any, Any, Any]]
 _REGISTRY: dict[str, WorkflowFn] = {}
 
 
-def workflow(fn: WorkflowFn | None = None, *, name: str | None = None):
+def workflow(fn: WorkflowFn | None = None, *, name: str | None = None, version: int = 1):
     """Register an ``async def`` function as a workflow.
 
-    Usable bare (``@workflow``) or with a stable name (``@workflow(name="x")``).
+    Usable bare (``@workflow``) or with options (``@workflow(name="x", version=2)``).
     Give long-lived workflows an explicit name so renaming the function does
     not orphan persisted runs.
+
+    ``version`` is pinned into each run at start: resumed runs keep the version
+    they started with, exposed as ``ctx.version``, so new code can branch
+    (``if ctx.version >= 2: ...``) without breaking in-flight runs.
     """
 
     def decorate(func: WorkflowFn) -> WorkflowFn:
         if not inspect.iscoroutinefunction(func):
             raise TypeError(f"workflow {func!r} must be an 'async def' function")
+        if version < 1:
+            raise ValueError("workflow version must be >= 1")
         wf_name = name or func.__name__
         if wf_name in _REGISTRY and _REGISTRY[wf_name] is not func:
             logger.debug("workflow %r re-registered (previous definition replaced)", wf_name)
         _REGISTRY[wf_name] = func
         func.__sicim_workflow__ = wf_name  # type: ignore[attr-defined]
+        func.__sicim_version__ = version  # type: ignore[attr-defined]
         return func
 
     return decorate(fn) if fn is not None else decorate
+
+
+def workflow_version(fn: WorkflowFn) -> int:
+    return getattr(fn, "__sicim_version__", 1)
 
 
 def workflow_name(fn: WorkflowFn) -> str:

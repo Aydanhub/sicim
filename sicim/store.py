@@ -41,6 +41,7 @@ class RunStatus(str, enum.Enum):
 class RunRecord:
     run_id: str
     workflow: str
+    version: int = 1
     args: list[Any] = field(default_factory=list)
     kwargs: dict[str, Any] = field(default_factory=dict)
     status: RunStatus = RunStatus.RUNNING
@@ -98,6 +99,23 @@ class Store(abc.ABC):
     @abc.abstractmethod
     async def mark_signal_consumed(self, run_id: str, seq: int) -> None: ...
 
+    # -- worker leases -------------------------------------------------------
+    # A lease grants one worker the exclusive right to drive a run. Acquiring
+    # succeeds when the lease is free, expired, or already held by ``owner``.
+
+    @abc.abstractmethod
+    async def try_acquire_lease(self, run_id: str, owner: str, ttl: float) -> bool: ...
+
+    @abc.abstractmethod
+    async def renew_lease(self, run_id: str, owner: str, ttl: float) -> bool: ...
+
+    @abc.abstractmethod
+    async def release_lease(self, run_id: str, owner: str) -> None: ...
+
+    @abc.abstractmethod
+    async def load_lease(self, run_id: str) -> tuple[str, float] | None:
+        """Current ``(owner, expires_at)`` for the run, or None."""
+
     def close(self) -> None:  # noqa: B027 - optional hook
         pass
 
@@ -109,6 +127,7 @@ class InMemoryStore(Store):
         self._runs: dict[str, RunRecord] = {}
         self._events: dict[str, list[Event]] = {}
         self._signals: dict[str, list[SignalRecord]] = {}
+        self._leases: dict[str, tuple[str, float]] = {}
 
     async def create_run(self, record: RunRecord) -> None:
         self._runs[record.run_id] = dataclasses.replace(record)
@@ -159,11 +178,35 @@ class InMemoryStore(Store):
                 inbox[i] = dataclasses.replace(sig, consumed=True)
                 return
 
+    async def try_acquire_lease(self, run_id: str, owner: str, ttl: float) -> bool:
+        now = time.time()
+        current = self._leases.get(run_id)
+        if current is None or current[0] == owner or current[1] < now:
+            self._leases[run_id] = (owner, now + ttl)
+            return True
+        return False
+
+    async def renew_lease(self, run_id: str, owner: str, ttl: float) -> bool:
+        current = self._leases.get(run_id)
+        if current is not None and current[0] == owner:
+            self._leases[run_id] = (owner, time.time() + ttl)
+            return True
+        return False
+
+    async def release_lease(self, run_id: str, owner: str) -> None:
+        current = self._leases.get(run_id)
+        if current is not None and current[0] == owner:
+            del self._leases[run_id]
+
+    async def load_lease(self, run_id: str) -> tuple[str, float] | None:
+        return self._leases.get(run_id)
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     workflow TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
     args TEXT NOT NULL,
     kwargs TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -172,6 +215,11 @@ CREATE TABLE IF NOT EXISTS runs (
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS leases (
+    run_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    expires_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
     run_id TEXT NOT NULL,
@@ -211,6 +259,10 @@ class SQLiteStore(Store):
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            # Migration for v0.1 databases created before run versioning.
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(runs)")}
+            if "version" not in columns:
+                self._conn.execute("ALTER TABLE runs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
             self._conn.commit()
 
     def close(self) -> None:
@@ -229,11 +281,12 @@ class SQLiteStore(Store):
     async def create_run(self, record: RunRecord) -> None:
         def op():
             self._conn.execute(
-                "INSERT INTO runs (run_id, workflow, args, kwargs, status, result, error,"
-                " cancel_requested, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO runs (run_id, workflow, version, args, kwargs, status, result, error,"
+                " cancel_requested, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.run_id,
                     record.workflow,
+                    record.version,
                     serde.encode(record.args),
                     serde.encode(record.kwargs),
                     record.status.value,
@@ -253,6 +306,7 @@ class SQLiteStore(Store):
         return RunRecord(
             run_id=row["run_id"],
             workflow=row["workflow"],
+            version=row["version"],
             args=serde.decode(row["args"]),
             kwargs=serde.decode(row["kwargs"]),
             status=RunStatus(row["status"]),
@@ -371,3 +425,46 @@ class SQLiteStore(Store):
             self._conn.commit()
 
         await self._run(op)
+
+    # -- leases --------------------------------------------------------------
+
+    async def try_acquire_lease(self, run_id: str, owner: str, ttl: float) -> bool:
+        def op():
+            now = time.time()
+            cursor = self._conn.execute(
+                "INSERT INTO leases (run_id, owner, expires_at) VALUES (?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at "
+                "WHERE leases.owner = excluded.owner OR leases.expires_at < ?",
+                (run_id, owner, now + ttl, now),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+        return await self._run(op)
+
+    async def renew_lease(self, run_id: str, owner: str, ttl: float) -> bool:
+        def op():
+            cursor = self._conn.execute(
+                "UPDATE leases SET expires_at = ? WHERE run_id = ? AND owner = ?",
+                (time.time() + ttl, run_id, owner),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+        return await self._run(op)
+
+    async def release_lease(self, run_id: str, owner: str) -> None:
+        def op():
+            self._conn.execute("DELETE FROM leases WHERE run_id = ? AND owner = ?", (run_id, owner))
+            self._conn.commit()
+
+        await self._run(op)
+
+    async def load_lease(self, run_id: str) -> tuple[str, float] | None:
+        def op():
+            row = self._conn.execute(
+                "SELECT owner, expires_at FROM leases WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return (row["owner"], row["expires_at"]) if row else None
+
+        return await self._run(op)

@@ -38,7 +38,7 @@ async def _show(store: SQLiteStore, run_id: str) -> None:
         print(f"run '{run_id}' not found", file=sys.stderr)
         raise SystemExit(1)
     print(f"run:      {record.run_id}")
-    print(f"workflow: {record.workflow}")
+    print(f"workflow: {record.workflow} (v{record.version})")
     print(f"status:   {record.status.value}")
     print(f"args:     {record.args!r}")
     if record.kwargs:

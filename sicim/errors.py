@@ -85,6 +85,33 @@ class WorkflowCancelled(SicimError):
         super().__init__(f"run '{run_id}' was cancelled (compensations applied)")
 
 
+class LeaseUnavailable(SicimError):
+    """Another worker currently holds the lease for this run.
+
+    Raised by ``start``/``resume`` when the run is being driven elsewhere;
+    ``recover()`` silently skips leased runs instead.
+    """
+
+    def __init__(self, run_id: str, owner: str | None = None):
+        self.run_id = run_id
+        self.owner = owner
+        suffix = f" (held by '{owner}')" if owner else ""
+        super().__init__(f"run '{run_id}' is leased by another worker{suffix}")
+
+
+class ChildFailed(SicimError):
+    """An awaited child workflow ended in a terminal error state."""
+
+    def __init__(self, workflow: str, run_id: str, error_type: str, error_message: str):
+        self.workflow = workflow
+        self.run_id = run_id  # the child's run id
+        self.error_type = error_type
+        self.error_message = error_message
+        super().__init__(
+            f"child workflow '{workflow}' (run '{run_id}') failed: {error_type}: {error_message}"
+        )
+
+
 class CompensationFailed(SicimError):
     """One or more compensations failed permanently; manual intervention needed.
 

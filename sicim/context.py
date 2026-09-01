@@ -16,6 +16,7 @@ in steps.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import inspect
 import logging
@@ -26,9 +27,18 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from . import serde
-from .errors import NonDeterminismError, StepFailed, WaitTimeout
+from .errors import (
+    ChildFailed,
+    CompensationFailed,
+    NonDeterminismError,
+    StepFailed,
+    WaitTimeout,
+    WorkflowCancelled,
+    WorkflowFailed,
+)
 from .journal import Journal, Kind
 from .retry import RetryPolicy
+from .workflow import WorkflowFn, workflow_name
 
 if TYPE_CHECKING:
     from .runtime import Runtime
@@ -66,9 +76,14 @@ class _Compensation:
 class WorkflowContext:
     """Handle passed as the first argument to every workflow function."""
 
-    def __init__(self, *, run_id: str, workflow_name: str, runtime: "Runtime", journal: Journal):
+    def __init__(
+        self, *, run_id: str, workflow_name: str, runtime: "Runtime", journal: Journal, version: int = 1
+    ):
         self.run_id = run_id
         self.workflow_name = workflow_name
+        #: Workflow version pinned at run start. New code branches on it
+        #: (``if ctx.version >= 2: ...``) to evolve without breaking old runs.
+        self.version = version
         self._runtime = runtime
         self._journal = journal
         self._op_counter = 0
@@ -342,6 +357,125 @@ class WorkflowContext:
                 break
         return failures
 
+    # -- child workflows -----------------------------------------------------
+
+    def child(
+        self,
+        wf: WorkflowFn,
+        /,
+        *args: Any,
+        run_id: str | None = None,
+        compensate: Callable[..., Any] | None = None,
+        compensate_args: tuple[Any, ...] = (),
+        compensate_kwargs: dict[str, Any] | None = None,
+        compensate_retry: RetryPolicy | None = None,
+        **kwargs: Any,
+    ) -> Awaitable[Any]:
+        """Run another registered workflow as a durable child and await its result.
+
+        The child is a full run of its own (own journal, own compensations, own
+        version pin), so a crash resumes parent and child independently. The
+        child's run id is deterministic (``<parent>.c<op>`` unless ``run_id`` is
+        given), which makes starting it idempotent across replays. A terminal
+        child error raises :class:`ChildFailed` in the parent; cancelling the
+        parent while it awaits a child cancels the child too.
+        """
+        op_id = self._next_op()
+        return self._child(
+            op_id,
+            wf,
+            args,
+            kwargs,
+            run_id=run_id,
+            compensate=compensate,
+            compensate_args=compensate_args,
+            compensate_kwargs=compensate_kwargs or {},
+            compensate_retry=compensate_retry,
+        )
+
+    async def _child(
+        self,
+        op_id: int,
+        wf: WorkflowFn,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        run_id: str | None,
+        compensate: Callable[..., Any] | None,
+        compensate_args: tuple[Any, ...],
+        compensate_kwargs: dict[str, Any],
+        compensate_retry: RetryPolicy | None,
+    ) -> Any:
+        journal = self._journal
+        child_name = workflow_name(wf)
+        recorded = self._expect(Kind.CHILD_SCHEDULED, op_id, name=child_name)
+        if recorded is None:
+            self._check_cancel()
+            child_run_id = run_id or f"{self.run_id}.c{op_id}"
+            recorded = await journal.append(
+                Kind.CHILD_SCHEDULED,
+                op_id,
+                {"name": child_name, "child_run_id": child_run_id, "args": serde.preview(args)},
+            )
+        child_run_id = recorded.payload["child_run_id"]
+
+        def register_compensation() -> None:
+            if compensate is not None:
+                self._comp_stack.append(
+                    _Compensation(
+                        op_id=op_id,
+                        name=_callable_name(compensate),
+                        fn=compensate,
+                        args=compensate_args,
+                        kwargs=compensate_kwargs,
+                        retry=compensate_retry,
+                    )
+                )
+
+        completed = journal.find(Kind.CHILD_COMPLETED, op_id)
+        if completed is not None:
+            register_compensation()
+            return completed.payload["result"]
+        failed = journal.find(Kind.CHILD_FAILED, op_id)
+        if failed is not None:
+            error = failed.payload["error"]
+            raise ChildFailed(child_name, child_run_id, error["type"], error["message"])
+
+        # Live: start (or re-attach to) the child run and await it, staying
+        # responsive to cooperative cancellation of the parent.
+        handle = await self._runtime.start(wf, *args, run_id=child_run_id, **kwargs)
+        result_task = asyncio.ensure_future(handle.result())
+        cancel_task = asyncio.ensure_future(self._runtime._cancel_event(self.run_id).wait())
+        try:
+            await asyncio.wait({result_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            cancel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_task
+        if not result_task.done():
+            result_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await result_task
+            await self._runtime.cancel(child_run_id)  # propagate; child compensates itself
+            raise asyncio.CancelledError()
+        try:
+            result = result_task.result()
+        except (WorkflowFailed, WorkflowCancelled, CompensationFailed) as exc:
+            await journal.append(
+                Kind.CHILD_FAILED,
+                op_id,
+                {"name": child_name, "child_run_id": child_run_id, "error": serde.error_info(exc)},
+            )
+            raise ChildFailed(child_name, child_run_id, type(exc).__name__, str(exc)) from exc
+        # NonDeterminismError (and the like) propagates raw: both runs stay resumable.
+        await journal.append(
+            Kind.CHILD_COMPLETED,
+            op_id,
+            {"name": child_name, "child_run_id": child_run_id, "result": result},
+        )
+        register_compensation()
+        return result
+
     # -- durable timers ------------------------------------------------------
 
     def sleep(self, seconds: float) -> Awaitable[None]:
@@ -413,22 +547,29 @@ class WorkflowContext:
                 return signal.payload
 
             self._check_cancel()
+            # In-process signals resolve the waiter instantly; the poll cap
+            # exists so signals written to the store by *another* worker (which
+            # cannot wake our future) are still picked up.
+            wait_cap = self._runtime.signal_poll_interval
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    await journal.append(Kind.WAIT_TIMED_OUT, op_id, {"name": name})
+                    raise WaitTimeout(name, op_id)
+                wait_cap = min(wait_cap, remaining)
             waiter = self._runtime._register_waiter(self.run_id)
             try:
-                if deadline is None:
-                    await waiter
-                else:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        await journal.append(Kind.WAIT_TIMED_OUT, op_id, {"name": name})
-                        raise WaitTimeout(name, op_id)
-                    try:
-                        await asyncio.wait_for(waiter, remaining)
-                    except TimeoutError:
-                        await journal.append(Kind.WAIT_TIMED_OUT, op_id, {"name": name})
-                        raise WaitTimeout(name, op_id) from None
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(waiter, wait_cap)
             finally:
                 self._runtime._unregister_waiter(self.run_id, waiter)
+            if deadline is not None and time.time() >= deadline:
+                # Re-scan once before declaring the timeout, so a signal that
+                # raced the deadline is not lost.
+                exclude = journal.consumed_signal_seqs | self._inflight_signal_seqs
+                if await self._runtime._next_unconsumed_signal(self.run_id, name, exclude) is None:
+                    await journal.append(Kind.WAIT_TIMED_OUT, op_id, {"name": name})
+                    raise WaitTimeout(name, op_id)
 
     # -- deterministic values ------------------------------------------------
 

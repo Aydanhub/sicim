@@ -17,12 +17,15 @@ non-determinism is detected.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
     from .store import Store
+
+logger = logging.getLogger("sicim")
 
 
 class Kind:
@@ -46,6 +49,11 @@ class Kind:
     COMP_COMPLETED = "comp_completed"
     COMP_FAILED = "comp_failed"
 
+    # Child workflows
+    CHILD_SCHEDULED = "child_scheduled"
+    CHILD_COMPLETED = "child_completed"
+    CHILD_FAILED = "child_failed"
+
     # Durable timers
     TIMER_CREATED = "timer_created"
     TIMER_FIRED = "timer_fired"
@@ -61,7 +69,14 @@ class Kind:
 
 #: Kinds that define an operation slot; used for non-determinism detection.
 DEFINING_KINDS = frozenset(
-    {Kind.STEP_SCHEDULED, Kind.TIMER_CREATED, Kind.WAIT_CREATED, Kind.VALUE_RECORDED, Kind.COMP_REGISTERED}
+    {
+        Kind.STEP_SCHEDULED,
+        Kind.TIMER_CREATED,
+        Kind.WAIT_CREATED,
+        Kind.VALUE_RECORDED,
+        Kind.COMP_REGISTERED,
+        Kind.CHILD_SCHEDULED,
+    }
 )
 
 
@@ -81,9 +96,16 @@ class Journal:
     (``ctx.gather``) get consistent sequence numbers and durable ordering.
     """
 
-    def __init__(self, run_id: str, store: "Store", events: Iterable[Event]):
+    def __init__(
+        self,
+        run_id: str,
+        store: "Store",
+        events: Iterable[Event],
+        on_append: Callable[[str, Event], None] | None = None,
+    ):
         self.run_id = run_id
         self._store = store
+        self._on_append = on_append
         self._events: list[Event] = list(events)
         self._first: dict[tuple[str, int], Event] = {}
         self._counts: dict[tuple[str, int], int] = {}
@@ -131,7 +153,12 @@ class Journal:
             await self._store.append_event(self.run_id, event)
             self._events.append(event)
             self._absorb(event)
-            return event
+        if self._on_append is not None:
+            try:
+                self._on_append(self.run_id, event)
+            except Exception:  # noqa: BLE001 - observers must never break a run
+                logger.exception("on_event observer raised for run '%s'", self.run_id)
+        return event
 
     async def append_once(self, kind: str, op_id: int, payload: dict[str, Any]) -> Event:
         """Append unless an event of this (kind, op_id) already exists."""

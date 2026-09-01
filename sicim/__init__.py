@@ -6,7 +6,9 @@ long-running (LLM agent) workflows. Zero runtime dependencies.
 
 from .context import WorkflowContext
 from .errors import (
+    ChildFailed,
     CompensationFailed,
+    LeaseUnavailable,
     NonDeterminismError,
     NonRetryable,
     RunNotFound,
@@ -24,11 +26,13 @@ from .runtime import RunHandle, Runtime
 from .store import InMemoryStore, RunRecord, RunStatus, SignalRecord, SQLiteStore, Store
 from .workflow import get_workflow, workflow
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
+    "ChildFailed",
     "CompensationFailed",
     "Event",
+    "LeaseUnavailable",
     "InMemoryStore",
     "Kind",
     "NO_RETRY",
