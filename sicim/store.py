@@ -31,6 +31,9 @@ class RunStatus(str, enum.Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     COMPENSATION_FAILED = "compensation_failed"
+    #: The run ended by chaining into a fresh run (continue-as-new);
+    #: ``RunRecord.continued_to`` names the successor.
+    CONTINUED = "continued"
 
     @property
     def terminal(self) -> bool:
@@ -48,6 +51,7 @@ class RunRecord:
     result: Any = None
     error: dict[str, Any] | None = None
     cancel_requested: bool = False
+    continued_to: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -79,7 +83,12 @@ class Store(abc.ABC):
         result: Any = _UNSET,
         error: dict[str, Any] | None | Any = _UNSET,
         cancel_requested: bool | Any = _UNSET,
+        continued_to: str | None | Any = _UNSET,
     ) -> None: ...
+
+    @abc.abstractmethod
+    async def delete_run(self, run_id: str) -> None:
+        """Remove a run and everything attached to it (events, signals, lease)."""
 
     @abc.abstractmethod
     async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]: ...
@@ -119,6 +128,10 @@ class Store(abc.ABC):
     def close(self) -> None:  # noqa: B027 - optional hook
         pass
 
+    async def aclose(self) -> None:
+        """Async close; defaults to the sync ``close()``."""
+        self.close()
+
 
 class InMemoryStore(Store):
     """Non-durable store for tests and throwaway runs."""
@@ -138,7 +151,9 @@ class InMemoryStore(Store):
         record = self._runs.get(run_id)
         return dataclasses.replace(record) if record is not None else None
 
-    async def update_run(self, run_id, *, status=_UNSET, result=_UNSET, error=_UNSET, cancel_requested=_UNSET):
+    async def update_run(
+        self, run_id, *, status=_UNSET, result=_UNSET, error=_UNSET, cancel_requested=_UNSET, continued_to=_UNSET
+    ):
         record = self._runs[run_id]
         if status is not _UNSET:
             record.status = status
@@ -148,7 +163,15 @@ class InMemoryStore(Store):
             record.error = error
         if cancel_requested is not _UNSET:
             record.cancel_requested = cancel_requested
+        if continued_to is not _UNSET:
+            record.continued_to = continued_to
         record.updated_at = time.time()
+
+    async def delete_run(self, run_id: str) -> None:
+        self._runs.pop(run_id, None)
+        self._events.pop(run_id, None)
+        self._signals.pop(run_id, None)
+        self._leases.pop(run_id, None)
 
     async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]:
         records = sorted(self._runs.values(), key=lambda r: r.created_at)
@@ -213,6 +236,7 @@ CREATE TABLE IF NOT EXISTS runs (
     result TEXT,
     error TEXT,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
+    continued_to TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -259,10 +283,12 @@ class SQLiteStore(Store):
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
-            # Migration for v0.1 databases created before run versioning.
+            # Migrations for databases created by older sicim versions.
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(runs)")}
             if "version" not in columns:
                 self._conn.execute("ALTER TABLE runs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            if "continued_to" not in columns:
+                self._conn.execute("ALTER TABLE runs ADD COLUMN continued_to TEXT")
             self._conn.commit()
 
     def close(self) -> None:
@@ -282,7 +308,7 @@ class SQLiteStore(Store):
         def op():
             self._conn.execute(
                 "INSERT INTO runs (run_id, workflow, version, args, kwargs, status, result, error,"
-                " cancel_requested, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " cancel_requested, continued_to, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.run_id,
                     record.workflow,
@@ -293,6 +319,7 @@ class SQLiteStore(Store):
                     serde.encode(record.result),
                     serde.encode(record.error),
                     int(record.cancel_requested),
+                    record.continued_to,
                     record.created_at,
                     record.updated_at,
                 ),
@@ -313,6 +340,7 @@ class SQLiteStore(Store):
             result=serde.decode(row["result"]) if row["result"] is not None else None,
             error=serde.decode(row["error"]) if row["error"] is not None else None,
             cancel_requested=bool(row["cancel_requested"]),
+            continued_to=row["continued_to"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -324,7 +352,9 @@ class SQLiteStore(Store):
 
         return await self._run(op)
 
-    async def update_run(self, run_id, *, status=_UNSET, result=_UNSET, error=_UNSET, cancel_requested=_UNSET):
+    async def update_run(
+        self, run_id, *, status=_UNSET, result=_UNSET, error=_UNSET, cancel_requested=_UNSET, continued_to=_UNSET
+    ):
         sets, params = ["updated_at = ?"], [time.time()]
         if status is not _UNSET:
             sets.append("status = ?")
@@ -338,10 +368,21 @@ class SQLiteStore(Store):
         if cancel_requested is not _UNSET:
             sets.append("cancel_requested = ?")
             params.append(int(cancel_requested))
+        if continued_to is not _UNSET:
+            sets.append("continued_to = ?")
+            params.append(continued_to)
         params.append(run_id)
 
         def op():
             self._conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE run_id = ?", params)
+            self._conn.commit()
+
+        await self._run(op)
+
+    async def delete_run(self, run_id: str) -> None:
+        def op():
+            for table in ("events", "signals", "leases", "runs"):
+                self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             self._conn.commit()
 
         await self._run(op)

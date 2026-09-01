@@ -1,6 +1,6 @@
 [project]
 name = "sicim"
-version = "0.2.0"
+version = "0.3.0"
 description = "Durable agent runtime: deterministic replay, checkpoint resume and saga-style compensation for long-running LLM agent workflows."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,7 +19,15 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+postgres = ["psycopg[binary]>=3.1"]
+otel = ["opentelemetry-api>=1.20"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "psycopg[binary]>=3.1",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+]
 
 [build-system]
 requires = ["hatchling"]

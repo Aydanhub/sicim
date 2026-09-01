@@ -39,6 +39,28 @@ async def test_sqlite_survives_store_reopen(tmp_path):
     store2.close()
 
 
+async def test_delete_run_removes_everything(store):
+    gate = Gate(hang_on=set())  # never hangs; just a friendly step
+
+    @workflow(name="wf_delete_run")
+    async def wf(ctx):
+        await ctx.step(gate, name="gate")
+        return await ctx.wait_event("go")
+
+    rt = Runtime(store)
+    await rt.start(wf, run_id="del1")
+    await rt.signal("del1", "go", {"x": 1})
+    handle = await rt.resume("del1")
+    assert await handle.result() == {"x": 1}
+    await rt.shutdown()
+
+    await store.delete_run("del1")
+    assert await store.load_run("del1") is None
+    assert await store.load_events("del1") == []
+    assert await store.load_signals("del1") == []
+    assert await store.load_lease("del1") is None
+
+
 async def test_sqlite_signal_roundtrip(tmp_path):
     path = str(tmp_path / "signals.db")
     store = SQLiteStore(path)

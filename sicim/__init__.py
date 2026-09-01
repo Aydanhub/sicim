@@ -26,7 +26,7 @@ from .runtime import RunHandle, Runtime
 from .store import InMemoryStore, RunRecord, RunStatus, SignalRecord, SQLiteStore, Store
 from .workflow import get_workflow, workflow
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ChildFailed",

@@ -1,0 +1,69 @@
+"""OpenTelemetry observer: spans from journal events."""
+
+import pytest
+
+otel_sdk = pytest.importorskip("opentelemetry.sdk")
+
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
+
+from sicim import NonRetryable, Runtime, WorkflowFailed, workflow
+from sicim.otel import otel_observer
+
+
+def make_tracer():
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider.get_tracer("sicim-test"), exporter
+
+
+async def ok_step():
+    return "ok"
+
+
+async def test_run_and_step_spans_are_linked(store):
+    tracer, exporter = make_tracer()
+    rt = Runtime(store, on_event=otel_observer(tracer))
+
+    @workflow(name="wf_otel_ok")
+    async def wf(ctx):
+        await ctx.step(ok_step, name="işlem")
+        return "done"
+
+    handle = await rt.start(wf, run_id="ot1")
+    assert await handle.result() == "done"
+    await rt.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    run_span = spans["sicim.run wf_otel_ok"]
+    step_span = spans["sicim.step işlem"]
+    assert step_span.parent is not None
+    assert step_span.parent.span_id == run_span.context.span_id
+    assert step_span.context.trace_id == run_span.context.trace_id
+    assert step_span.attributes["sicim.attempts"] == 1
+    assert run_span.attributes["sicim.outcome"] == "run_completed"
+    assert step_span.end_time >= step_span.start_time
+
+
+async def test_failed_run_span_has_error_status(store):
+    tracer, exporter = make_tracer()
+    rt = Runtime(store, on_event=otel_observer(tracer))
+
+    async def boom():
+        raise NonRetryable("patladı")
+
+    @workflow(name="wf_otel_fail")
+    async def wf(ctx):
+        await ctx.step(boom)
+
+    handle = await rt.start(wf, run_id="ot2")
+    with pytest.raises(WorkflowFailed):
+        await handle.result()
+    await rt.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert spans["sicim.step boom"].status.status_code is StatusCode.ERROR
+    assert spans["sicim.run wf_otel_fail"].status.status_code is StatusCode.ERROR

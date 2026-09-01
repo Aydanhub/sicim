@@ -63,6 +63,19 @@ def _is_async_callable(fn: Callable[..., Any]) -> bool:
     return call is not None and inspect.iscoroutinefunction(call)
 
 
+class _ContinueAsNew(BaseException):
+    """Internal control flow for ctx.continue_as_new (not an error).
+
+    BaseException so workflow-level ``except Exception`` blocks cannot
+    accidentally swallow it.
+    """
+
+    def __init__(self, next_args: list, next_kwargs: dict):
+        self.next_args = next_args
+        self.next_kwargs = next_kwargs
+        super().__init__("workflow requested continue-as-new")
+
+
 @dataclass
 class _Compensation:
     op_id: int
@@ -570,6 +583,29 @@ class WorkflowContext:
                 if await self._runtime._next_unconsumed_signal(self.run_id, name, exclude) is None:
                     await journal.append(Kind.WAIT_TIMED_OUT, op_id, {"name": name})
                     raise WaitTimeout(name, op_id)
+
+    # -- continue-as-new -----------------------------------------------------
+
+    async def continue_as_new(self, *args: Any, **kwargs: Any) -> Any:
+        """End this run and chain into a fresh run of the same workflow.
+
+        The successor starts with a brand-new (empty) journal and the given
+        arguments — this is how an agent that loops forever keeps its journal
+        bounded: carry the state you need in ``args`` and continue every N
+        iterations. The successor pins the *currently registered* workflow
+        version, so a continue is also the natural upgrade point.
+
+        ``handle.result()`` transparently follows the chain to the final
+        outcome; ``signal()`` and ``cancel()`` on any run id in the chain are
+        routed to the live run. Registered compensations do NOT carry over —
+        a continued run counts as finished, like a successful return.
+
+        This call never returns.
+        """
+        raise _ContinueAsNew(
+            serde.roundtrip(list(args)) or [],
+            serde.roundtrip(kwargs) or {},
+        )
 
     # -- deterministic values ------------------------------------------------
 

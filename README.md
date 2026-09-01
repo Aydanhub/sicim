@@ -1,6 +1,6 @@
 # sicim
 
-**Durable agent runtime** — uzun süren (LLM agent) workflow'ları için deterministik replay, checkpoint'ten devam ve saga-style compensation. Sıfır çalışma zamanı bağımlılığı; depolama SQLite (WAL) veya bellek içi.
+**Durable agent runtime** — uzun süren (LLM agent) workflow'ları için deterministik replay, checkpoint'ten devam ve saga-style compensation. Çekirdek sıfır bağımlılık; depolama SQLite (WAL), PostgreSQL (`sicim[postgres]`) veya bellek içi.
 
 Bir agent workflow'u saatlerce sürebilir, pahalı LLM çağrıları yapar, insan onayı bekler ve süreç her an ölebilir. sicim'in vaadi: **süreç çökse bile workflow kaldığı yerden devam eder; tamamlanmış hiçbir adım (hiçbir LLM çağrısı) tekrar çalıştırılmaz; başarısızlıkta yan etkiler saga telafileriyle geri alınır.**
 
@@ -159,6 +159,36 @@ async def order_flow(ctx, order_id):
 
 Versiyon run başlarken kayda yazılır ve **run ömrü boyunca sabittir**: v1 ile başlamış bir run, v2 kodu deploy edildikten sonra devam ettirildiğinde `ctx.version == 1` görür ve eski dalı izler — journal'la uyum bozulmaz. Eski dalları, o versiyondaki tüm run'lar bitince silebilirsiniz.
 
+### Continue-as-new: sonsuz döngülü agent'lar
+
+Journal append-only olduğu için sonsuza dek dönen bir agent'ın journal'ı sınırsız büyür. Çözüm, run'ı periyodik olarak taze bir run'a zincirlemek:
+
+```python
+@sicim.workflow
+async def agent_loop(ctx, state):
+    for _ in range(100):                       # run başına sınırlı iterasyon
+        state = await ctx.step(do_work, state)
+        if state.get("done"):
+            return state
+    await ctx.continue_as_new(state)           # asla geri dönmez
+```
+
+`continue_as_new(*args)` mevcut run'ı `CONTINUED` durumuyla bitirir ve aynı workflow'un **boş journal'lı** yeni bir run'ını (`run#2`, `run#3`, …) başlatır — taşımak istediğiniz durumu argümanlarda taşırsınız. `handle.result()` zinciri sonuna kadar şeffafça takip eder; `signal()`/`cancel()` zincirdeki herhangi bir id ile çağrıldığında canlı run'a yönlenir. Ardıl run, *o an kayıtlı* workflow versiyonunu sabitler — yani continue noktası aynı zamanda doğal yükseltme noktasıdır. Kayıtlı telafiler ardıla taşınmaz (continue, başarılı dönüş gibi sayılır). Zincirin eski halkaları `prune` ile silinebilir.
+
+### PostgreSQL store
+
+```bash
+pip install 'sicim[postgres]'
+```
+
+```python
+from sicim.pg import PostgresStore
+store = await PostgresStore.connect("postgresql://user@host/db")
+rt = sicim.Runtime(store, worker_id="api-1")
+```
+
+Şema ilk bağlantıda oluşturulur. Lease'lerle birlikte bu backend, aynı veritabanını paylaşan **birden çok worker sürecinin** hedeflenen kurulumudur. Test paketi, PostgreSQL kuruluysa tüm senaryoları geçici bir yerel cluster'a karşı da koşar (`SICIM_PG_DSN` ile mevcut bir sunucuya yönlendirilebilir).
+
 ### Gözlemlenebilirlik
 
 ```python
@@ -166,6 +196,13 @@ rt = sicim.Runtime(store, on_event=lambda run_id, event: metrics.emit(run_id, ev
 ```
 
 Her journal append'inde çağrılır; hook'un fırlattığı hatalar loglanır ve run'ı asla etkilemez.
+
+**OpenTelemetry** (`pip install 'sicim[otel]'`): hazır bir observer, journal olaylarını span'lere çevirir — run başına bir üst span, tamamlanan her adım/timer/bekleme/çocuk/telafi için journal zaman damgalarını taşıyan bir alt span; hatalar ERROR statüsüyle işaretlenir. Replay span üretmez (replay journal'a yazmaz).
+
+```python
+from sicim.otel import otel_observer
+rt = sicim.Runtime(store, on_event=otel_observer())
+```
 
 ### İptal
 
@@ -197,16 +234,19 @@ Workflow **gövdesi** için (adımlar için değil):
 | `rt.status(run_id)` / `rt.events(run_id)` | Run kaydı / journal |
 | `rt.shutdown()` | Çökme-eşdeğeri durdurma (kiraları bırakır) |
 | `await handle` / `handle.result()` | Sonuç, ya da `WorkflowFailed` / `WorkflowCancelled` / `CompensationFailed` / `NonDeterminismError` |
-| `ctx.step / child / sleep / wait_event / now / random / uuid4 / gather / add_compensation / log / is_replaying / version` | Workflow içi API |
+| `ctx.step / child / sleep / wait_event / now / random / uuid4 / gather / add_compensation / continue_as_new / log / is_replaying / version` | Workflow içi API |
 
-Run durumları: `RUNNING → COMPLETED | FAILED | CANCELLED | COMPENSATION_FAILED`.
+Run durumları: `RUNNING → COMPLETED | FAILED | CANCELLED | COMPENSATION_FAILED | CONTINUED`.
 
 ## CLI
 
 ```bash
 python -m sicim --db sicim.db list
-python -m sicim --db sicim.db show <run_id>    # run kaydı + journal + sinyaller
+python -m sicim --db sicim.db show <run_id>            # run kaydı + journal + sinyaller
+python -m sicim --db sicim.db prune --older-than-days 30 --dry-run
 ```
+
+`prune`, verilen eşikten eski terminal run'ları (journal'larıyla birlikte) siler; `RUNNING` ve insan müdahalesi bekleyen `COMPENSATION_FAILED` run'lara asla dokunmaz. Tüm komutlar `--db` yerine `--pg DSN` ile PostgreSQL'e karşı da çalışır.
 
 ## Örnekler ve test
 
@@ -216,10 +256,11 @@ python -m sicim --db sicim.db show <run_id>    # run kaydı + journal + sinyalle
 .venv/bin/pytest -q                          # tüm senaryolar iki backend'de de koşar
 ```
 
-## v0.2 kısıtları ve yol haritası
+## v0.3 kısıtları ve yol haritası
 
 - Sinyal, var olmayan run'a gönderilemez (önce `start`).
 - Retry backoff *bekleyişi* journal'lanmaz (deneme sayısı journal'lanır); çökme sonrası sıradaki deneme hemen yapılır.
 - Lease devralma TTL çözünürlüğündedir: ölen worker'ın run'ı en fazla `lease_ttl` sonra devralınır.
 - Ebeveyn *başarısız olduğunda* (iptal değil), o an `gather` içinde koşan çocuklar bağımsız devam eder — gerekirse telafide `cancel` edin.
-- Yol haritası: journal sıkıştırma / continue-as-new (sonsuz döngülü agent'lar için), Postgres store, sinyal aboneliği (poll yerine push), OpenTelemetry entegrasyonu.
+- PostgresStore worker süreci başına tek bağlantı kullanır; kopan bağlantıyı yeniden kurmaz (süreci yeniden başlatın, `recover()` devralır).
+- Yol haritası: sinyal aboneliği (poll yerine LISTEN/NOTIFY), otomatik zincir budama, bağlantı havuzu/yeniden bağlanma, dağıtık trace bağlamı (ebeveyn-çocuk span köprüsü).

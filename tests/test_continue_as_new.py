@@ -1,0 +1,99 @@
+"""Continue-as-new: bounded journals for infinitely-looping workflows."""
+
+import pytest
+from helpers import Gate, counting_step, wait_for_events
+
+from sicim import Kind, Runtime, RunStatus, workflow
+
+
+async def test_chain_runs_and_follow_result(rt):
+    counters = {}
+
+    @workflow(name="wf_can_basic")
+    async def wf(ctx, n, acc):
+        item = await ctx.step(counting_step(counters, "work", result=f"item-{n}"), name="work")
+        acc = acc + [item]
+        if n > 1:
+            await ctx.continue_as_new(n - 1, acc)
+        return {"acc": acc}
+
+    handle = await rt.start(wf, 3, [], run_id="chain")
+    result = await handle.result()  # transparently follows chain -> chain#2 -> chain#3
+
+    assert result == {"acc": ["item-3", "item-2", "item-1"]}
+    assert counters["work"] == 3  # one execution per run in the chain
+
+    first = await rt.status("chain")
+    assert first.status is RunStatus.CONTINUED
+    assert first.continued_to == "chain#2"
+    assert (await rt.status("chain#2")).continued_to == "chain#3"
+    assert (await rt.status("chain#3")).status is RunStatus.COMPLETED
+
+    # Each run's journal stays small — that is the point.
+    for run_id in ("chain", "chain#2"):
+        kinds = [e.kind for e in await rt.events(run_id)]
+        assert kinds[-1] == Kind.RUN_CONTINUED
+        assert len(kinds) <= 5
+
+
+async def test_crash_mid_chain_resumes_from_the_live_run(store):
+    counters = {}
+    gate = Gate()
+
+    @workflow(name="wf_can_crash")
+    async def wf(ctx, n):
+        await ctx.step(counting_step(counters, "work"), name="work")
+        if n > 1:
+            await ctx.continue_as_new(n - 1)
+        g = await ctx.step(gate, name="gate")
+        return {"finished_at": n, "gate": g}
+
+    rt1 = Runtime(store)
+    await rt1.start(wf, 3, run_id="cchain")
+    await gate.wait_reached()  # we are in the third run of the chain
+    await rt1.shutdown()
+    assert counters["work"] == 3
+
+    rt2 = Runtime(store)
+    recovered = await rt2.recover()
+    # Only the live tail is RUNNING; continued predecessors are terminal.
+    assert [h.run_id for h in recovered] == ["cchain#3"]
+
+    handle = await rt2.resume("cchain")  # old id still resolves to the final result
+    assert await handle.result() == {"finished_at": 1, "gate": "gate-2"}
+    assert counters["work"] == 3  # completed runs were not re-executed
+    await rt2.shutdown()
+
+
+async def test_signal_and_cancel_follow_the_chain(rt):
+    @workflow(name="wf_can_signal")
+    async def wf(ctx, hops):
+        if hops > 0:
+            await ctx.continue_as_new(hops - 1)
+        payload = await ctx.wait_event("go")
+        return payload
+
+    handle = await rt.start(wf, 2, run_id="schain")
+    await wait_for_events(rt.store, "schain#3", Kind.WAIT_CREATED, 1)
+
+    # Signalling the ORIGINAL id reaches the live run at the end of the chain.
+    await rt.signal("schain", "go", {"ok": True})
+    assert await handle.result() == {"ok": True}
+
+
+async def test_continued_runs_are_prunable_history(rt):
+    @workflow(name="wf_can_prune")
+    async def wf(ctx, n):
+        if n > 0:
+            await ctx.continue_as_new(n - 1)
+        return "end"
+
+    handle = await rt.start(wf, 2, run_id="pchain")
+    assert await handle.result() == "end"
+
+    # Old chain links can be deleted without touching the live tail's result.
+    await rt.store.delete_run("pchain")
+    await rt.store.delete_run("pchain#2")
+    assert (await rt.status("pchain#3")).result == "end"
+    assert await rt.store.load_run("pchain") is None
+    assert await rt.store.load_events("pchain") == []

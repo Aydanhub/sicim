@@ -36,6 +36,7 @@ class Kind:
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
     RUN_CANCELLED = "run_cancelled"
+    RUN_CONTINUED = "run_continued"
 
     # Step lifecycle
     STEP_SCHEDULED = "step_scheduled"

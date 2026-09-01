@@ -19,13 +19,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import uuid
 from typing import Any
 
 from typing import Callable
 
 from . import serde
-from .context import WorkflowContext
+from .context import WorkflowContext, _ContinueAsNew
 from .errors import (
     CompensationFailed,
     LeaseUnavailable,
@@ -42,14 +43,38 @@ from .workflow import WorkflowFn, get_workflow, workflow_name, workflow_version
 
 logger = logging.getLogger("sicim")
 
+_CHAIN_RE = re.compile(r"^(?P<base>.*)#(?P<n>\d+)$")
+
+
+def _next_chain_id(run_id: str) -> str:
+    match = _CHAIN_RE.match(run_id)
+    if match:
+        return f"{match.group('base')}#{int(match.group('n')) + 1}"
+    return f"{run_id}#2"
+
+
+class _Continued:
+    """Internal driver outcome: the run chained into ``next_run_id``."""
+
+    def __init__(self, next_run_id: str):
+        self.next_run_id = next_run_id
+
 
 class RunHandle:
     """Handle to a run: await it (or call ``result()``) for the outcome."""
 
-    def __init__(self, run_id: str, *, task: asyncio.Task | None = None, record: RunRecord | None = None):
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        task: asyncio.Task | None = None,
+        record: RunRecord | None = None,
+        runtime: "Runtime | None" = None,
+    ):
         self.run_id = run_id
         self._task = task
         self._record = record
+        self._runtime = runtime
 
     def done(self) -> bool:
         if self._task is not None:
@@ -57,15 +82,32 @@ class RunHandle:
         return self._record is not None and self._record.status.terminal
 
     async def result(self) -> Any:
-        """Return the workflow result, or raise the run's terminal error
-        (:class:`WorkflowFailed`, :class:`WorkflowCancelled`,
-        :class:`CompensationFailed`, :class:`NonDeterminismError`)."""
+        """Return the workflow result, following continue-as-new chains to the
+        final run, or raise the terminal error (:class:`WorkflowFailed`,
+        :class:`WorkflowCancelled`, :class:`CompensationFailed`,
+        :class:`NonDeterminismError`)."""
+        current: RunHandle = self
+        while True:
+            outcome = await current._outcome()
+            if isinstance(outcome, _Continued):
+                if current._runtime is None:
+                    raise SicimError(
+                        f"run '{current.run_id}' continued as '{outcome.next_run_id}' "
+                        "but this handle has no runtime to follow the chain with"
+                    )
+                current = await current._runtime.resume(outcome.next_run_id)
+                continue
+            return outcome
+
+    async def _outcome(self) -> Any:
         if self._task is not None:
             return await self._task
         record = self._record
         assert record is not None
         if record.status is RunStatus.COMPLETED:
             return record.result
+        if record.status is RunStatus.CONTINUED:
+            return _Continued(record.continued_to)
         error = record.error or {}
         if record.status is RunStatus.FAILED:
             raise WorkflowFailed(
@@ -126,6 +168,7 @@ class Runtime:
         self._cancel_flags: dict[str, bool] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._spawn_lock = asyncio.Lock()
+        self._closing = False
 
     # -- public API ----------------------------------------------------------
 
@@ -177,28 +220,33 @@ class Runtime:
         return handles
 
     async def signal(self, run_id: str, name: str, payload: Any = None) -> None:
-        """Deliver an external event to a run's inbox (waking it if needed)."""
+        """Deliver an external event to a run's inbox (waking it if needed).
+
+        A run that continued-as-new is followed to the live run in its chain.
+        """
         payload = serde.roundtrip(payload)
-        record = await self._load(run_id)
+        record = await self._follow_chain(await self._load(run_id))
         if record.status.terminal:
-            raise SicimError(f"cannot signal run '{run_id}': status is {record.status.value}")
-        await self.store.append_signal(run_id, name, payload)
-        handle = self._handles.get(run_id)
+            raise SicimError(f"cannot signal run '{record.run_id}': status is {record.status.value}")
+        await self.store.append_signal(record.run_id, name, payload)
+        handle = self._handles.get(record.run_id)
         if handle is None or handle.done():
             try:
                 await self._ensure(record)
             except LeaseUnavailable:
                 pass  # another worker drives it; its inbox poll picks the signal up
-        self._wake(run_id)
+        self._wake(record.run_id)
 
     async def cancel(self, run_id: str) -> None:
         """Request cancellation (cooperative): the run stops at its next *live*
         operation boundary — never mid-replay, never mid-step — runs its
         compensations, and ends as CANCELLED. A step already in flight is
-        allowed to finish first (use step ``timeout=`` to bound that)."""
-        record = await self._load(run_id)
+        allowed to finish first (use step ``timeout=`` to bound that).
+        A run that continued-as-new is followed to the live run in its chain."""
+        record = await self._follow_chain(await self._load(run_id))
         if record.status.terminal:
             return
+        run_id = record.run_id
         await self.store.update_run(run_id, cancel_requested=True)
         self._cancel_flags[run_id] = True
         self._cancel_event(run_id).set()
@@ -223,6 +271,7 @@ class Runtime:
         Incomplete runs stay RUNNING in the store; a later ``recover()``
         replays and continues them.
         """
+        self._closing = True
         tasks = [h._task for h in self._handles.values() if h._task is not None and not h._task.done()]
         for task in tasks:
             task.cancel()
@@ -248,14 +297,26 @@ class Runtime:
             raise RunNotFound(f"no run with id '{run_id}'")
         return record
 
+    async def _follow_chain(self, record: RunRecord) -> RunRecord:
+        """Follow continue-as-new links to the newest run in the chain."""
+        seen = {record.run_id}
+        while record.status is RunStatus.CONTINUED and record.continued_to:
+            if record.continued_to in seen:
+                break  # defensive: malformed chains must not loop forever
+            record = await self._load(record.continued_to)
+            seen.add(record.run_id)
+        return record
+
     async def _ensure(self, record: RunRecord) -> RunHandle:
         """Get the live handle for a run, spawning its driver task if needed."""
         async with self._spawn_lock:
             handle = self._handles.get(record.run_id)
             if handle is not None and not handle.done():
                 return handle
-            if record.status.terminal:
-                return RunHandle(record.run_id, record=record)
+            if record.status.terminal or self._closing:
+                # A shutting-down runtime spawns nothing (crash-equivalence);
+                # recover() on the next runtime picks the run up.
+                return RunHandle(record.run_id, record=record, runtime=self)
             if not await self.store.try_acquire_lease(record.run_id, self.worker_id, self.lease_ttl):
                 lease = await self.store.load_lease(record.run_id)
                 raise LeaseUnavailable(record.run_id, lease[0] if lease else None)
@@ -276,7 +337,7 @@ class Runtime:
                 self._drive(record, wf, ctx, journal), name=f"sicim:{record.run_id}"
             )
             task.add_done_callback(self._retrieve_exception)
-            handle = RunHandle(record.run_id, task=task)
+            handle = RunHandle(record.run_id, task=task, runtime=self)
             self._handles[record.run_id] = handle
             return handle
 
@@ -325,6 +386,32 @@ class Runtime:
                     error={"type": "WorkflowCancelled", "message": "run was cancelled"},
                 )
                 raise WorkflowCancelled(run_id) from None
+            except _ContinueAsNew as cont:
+                # The run ends here and chains into a successor with a fresh
+                # journal. Every step below is idempotent, so a crash anywhere
+                # in this block resumes cleanly (replay reaches the same point).
+                next_id = _next_chain_id(run_id)
+                await journal.append_once(
+                    Kind.RUN_CONTINUED, -1,
+                    {"next_run_id": next_id, "args": serde.preview(cont.next_args)},
+                )
+                if await self.store.load_run(next_id) is None:
+                    await self.store.create_run(
+                        RunRecord(
+                            run_id=next_id,
+                            workflow=record.workflow,
+                            version=workflow_version(wf),  # upgrade point: current code's version
+                            args=cont.next_args,
+                            kwargs=cont.next_kwargs,
+                        )
+                    )
+                await self.store.update_run(run_id, status=RunStatus.CONTINUED, continued_to=next_id)
+                logger.info("[%s] continued as '%s'", run_id, next_id)
+                next_record = await self.store.load_run(next_id)
+                if next_record is not None and not next_record.status.terminal:
+                    with contextlib.suppress(LeaseUnavailable):
+                        await self._ensure(next_record)
+                return _Continued(next_id)
             except NonDeterminismError:
                 # Deliberately leave the run RUNNING and untouched: fixing the
                 # code and resuming again is the recovery path.
