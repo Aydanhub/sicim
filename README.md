@@ -140,6 +140,7 @@ Her `Runtime` bir *worker*'dır: bir run'ı sürmeden önce onun kirasını (lea
 - `recover()` başka worker'ın kiraladığı run'ları çalmaz, atlar; `start`/`resume` ise `LeaseUnavailable` fırlatır.
 - Bir worker ölürse kiraları TTL sonunda düşer ve run'ları başka worker tarafından devralınır; `shutdown()` kiraları hemen bırakır (hızlı devir).
 - Başka worker'ın sürdüğü run'a `signal()` gönderilebilir: sinyal store'a kuyruklanır, bekleyen run `signal_poll_interval` (varsayılan 1 sn) içinde alır. `cancel()` de aynı şekilde çalışır: bayrak store'a yazılır, süren worker heartbeat'inde görüp kooperatif iptali başlatır.
+- Store bir **push kanalı** sunuyorsa (PostgreSQL LISTEN/NOTIFY), süren worker ilk run'ında otomatik abone olur: başka worker'ın gönderdiği sinyal ve iptal, poll'ü veya heartbeat'i beklemeden anında ulaşır. Poll/heartbeat güvenlik ağı olarak kalır — dinleyici bağlantısı kopsa bile doğruluk bozulmaz, sadece gecikme poll aralığına döner.
 
 ```python
 rt = sicim.Runtime(store, worker_id="api-1", lease_ttl=30.0, signal_poll_interval=1.0)
@@ -173,7 +174,9 @@ async def agent_loop(ctx, state):
     await ctx.continue_as_new(state)           # asla geri dönmez
 ```
 
-`continue_as_new(*args)` mevcut run'ı `CONTINUED` durumuyla bitirir ve aynı workflow'un **boş journal'lı** yeni bir run'ını (`run#2`, `run#3`, …) başlatır — taşımak istediğiniz durumu argümanlarda taşırsınız. `handle.result()` zinciri sonuna kadar şeffafça takip eder; `signal()`/`cancel()` zincirdeki herhangi bir id ile çağrıldığında canlı run'a yönlenir. Ardıl run, *o an kayıtlı* workflow versiyonunu sabitler — yani continue noktası aynı zamanda doğal yükseltme noktasıdır. Kayıtlı telafiler ardıla taşınmaz (continue, başarılı dönüş gibi sayılır). Zincirin eski halkaları `prune` ile silinebilir.
+`continue_as_new(*args)` mevcut run'ı `CONTINUED` durumuyla bitirir ve aynı workflow'un **boş journal'lı** yeni bir run'ını (`run#2`, `run#3`, …) başlatır — taşımak istediğiniz durumu argümanlarda taşırsınız. `handle.result()` zinciri sonuna kadar şeffafça takip eder; `signal()`/`cancel()` zincirdeki herhangi bir id ile çağrıldığında canlı run'a yönlenir. Ardıl run, *o an kayıtlı* workflow versiyonunu sabitler — yani continue noktası aynı zamanda doğal yükseltme noktasıdır. Kayıtlı telafiler ardıla taşınmaz (continue, başarılı dönüş gibi sayılır).
+
+**Otomatik zincir budama** — `Runtime(store, chain_keep=1)`: her continue'da canlı run'ın gerisindeki en yeni `chain_keep` halka journal'ını korur, daha eski halkaların journal'ı ve sinyal kutusu silinir. Run kayıtlarının kendisi (birkaç yüz bayt) yönlendirme için yerinde kalır: eski id'lerle `signal()`/`cancel()`/`result()` çalışmaya devam eder. Sonsuz döngülü bir agent'ın depolamasını sınırlayan budur; `chain_keep=None` (varsayılan) hiçbir şeye dokunmaz. Kayıtları tamamen silmek için `prune` CLI komutu duruyor.
 
 ### PostgreSQL store
 
@@ -187,7 +190,12 @@ store = await PostgresStore.connect("postgresql://user@host/db")
 rt = sicim.Runtime(store, worker_id="api-1")
 ```
 
-Şema ilk bağlantıda oluşturulur. Lease'lerle birlikte bu backend, aynı veritabanını paylaşan **birden çok worker sürecinin** hedeflenen kurulumudur. Test paketi, PostgreSQL kuruluysa tüm senaryoları geçici bir yerel cluster'a karşı da koşar (`SICIM_PG_DSN` ile mevcut bir sunucuya yönlendirilebilir).
+Şema ilk bağlantıda oluşturulur. Lease'lerle birlikte bu backend, aynı veritabanını paylaşan **birden çok worker sürecinin** hedeflenen kurulumudur:
+
+- **Yeniden bağlanma:** kopan bağlantı bir sonraki operasyonda şeffafça yeniden kurulur (sınırlı backoff'lu deneme). Denemeleri de aşan bir kesinti hata olarak yüzeye çıkar ve runtime bunu çökme-eşdeğeri sayar: run `RUNNING` kalır, sonraki `recover()` devam ettirir.
+- **LISTEN/NOTIFY:** her `signal()` ve `cancel()` ortak kanala NOTIFY yazar; süren worker'lar adanmış bir bağlantıyla dinler ve poll beklenmeden uyanır. Dinleyici bağlantısı da kopunca kendini yeniden kurar; aradaki boşluğu poll kapatır.
+
+Test paketi, PostgreSQL kuruluysa tüm senaryoları geçici bir yerel cluster'a karşı da koşar (`SICIM_PG_DSN` ile mevcut bir sunucuya yönlendirilebilir).
 
 ### Gözlemlenebilirlik
 
@@ -198,6 +206,8 @@ rt = sicim.Runtime(store, on_event=lambda run_id, event: metrics.emit(run_id, ev
 Her journal append'inde çağrılır; hook'un fırlattığı hatalar loglanır ve run'ı asla etkilemez.
 
 **OpenTelemetry** (`pip install 'sicim[otel]'`): hazır bir observer, journal olaylarını span'lere çevirir — run başına bir üst span, tamamlanan her adım/timer/bekleme/çocuk/telafi için journal zaman damgalarını taşıyan bir alt span; hatalar ERROR statüsüyle işaretlenir. Replay span üretmez (replay journal'a yazmaz).
+
+Çocuk workflow'un run span'i, ebeveynin run span'inin **altına bağlanır** — agent/sub-agent ağacının tamamı tek trace olarak görünür — ve `sicim.parent_run_id` attribute'unu taşır (ebeveyn-çocuk bağı `RunRecord.parent_run_id` olarak store'a da yazılır; CLI `show` gösterir). Çökme sonrası çocuğu *başka bir süreç* devralırsa yeni span orijinal trace'e katılamaz; attribute üzerinden korelasyon orada da kalır.
 
 ```python
 from sicim.otel import otel_observer
@@ -226,7 +236,7 @@ Workflow **gövdesi** için (adımlar için değil):
 | Öğe | Ne yapar |
 |---|---|
 | `@sicim.workflow` / `@sicim.workflow(name=..., version=N)` | `async def` fonksiyonu workflow olarak kaydeder; versiyon run'a sabitlenir |
-| `Runtime(store, default_retry=, worker_id=, lease_ttl=, signal_poll_interval=, on_event=)` | Worker; `InMemoryStore()` varsayılan |
+| `Runtime(store, default_retry=, worker_id=, lease_ttl=, signal_poll_interval=, chain_keep=, on_event=)` | Worker; `InMemoryStore()` varsayılan |
 | `rt.start(wf, *args, run_id=...)` | Run başlatır (`run_id` üzerinde idempotent) → `RunHandle` |
 | `rt.recover()` / `rt.resume(run_id)` | Yarım run'ları replay edip devam ettirir (kiralılar: atla / `LeaseUnavailable`) |
 | `rt.signal(run_id, name, payload)` | Olay teslim eder (gerekirse run'ı uyandırır; worker'lar arası çalışır) |
@@ -256,11 +266,12 @@ python -m sicim --db sicim.db prune --older-than-days 30 --dry-run
 .venv/bin/pytest -q                          # tüm senaryolar iki backend'de de koşar
 ```
 
-## v0.3 kısıtları ve yol haritası
+## v0.4 kısıtları ve yol haritası
 
 - Sinyal, var olmayan run'a gönderilemez (önce `start`).
 - Retry backoff *bekleyişi* journal'lanmaz (deneme sayısı journal'lanır); çökme sonrası sıradaki deneme hemen yapılır.
 - Lease devralma TTL çözünürlüğündedir: ölen worker'ın run'ı en fazla `lease_ttl` sonra devralınır.
 - Ebeveyn *başarısız olduğunda* (iptal değil), o an `gather` içinde koşan çocuklar bağımsız devam eder — gerekirse telafide `cancel` edin.
-- PostgresStore worker süreci başına tek bağlantı kullanır; kopan bağlantıyı yeniden kurmaz (süreci yeniden başlatın, `recover()` devralır).
-- Yol haritası: sinyal aboneliği (poll yerine LISTEN/NOTIFY), otomatik zincir budama, bağlantı havuzu/yeniden bağlanma, dağıtık trace bağlamı (ebeveyn-çocuk span köprüsü).
+- Push kanalı yalnız PostgreSQL'de; SQLite/bellek store'larında worker'lar arası sinyal/iptal poll ve heartbeat ile taşınır (tek süreç içinde zaten anındadır).
+- Çökme sonrası çocuğu başka süreç devralırsa span'i orijinal trace'e katılamaz; `sicim.parent_run_id` ile korelasyon kalır.
+- Yol haritası: journal'lanan retry backoff (çökme sonrası kalan bekleme korunur), run arama/etiketleme (workflow'a ve etikete göre listeleme), zamanlanmış/cron başlatma, web tabanlı izleme arayüzü.

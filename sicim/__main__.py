@@ -48,6 +48,8 @@ async def _show(store: Store, run_id: str) -> None:
     print(f"run:      {record.run_id}")
     print(f"workflow: {record.workflow} (v{record.version})")
     print(f"status:   {record.status.value}")
+    if record.parent_run_id:
+        print(f"parent:   {record.parent_run_id}")
     if record.continued_to:
         print(f"continued_to: {record.continued_to}")
     print(f"args:     {record.args!r}")

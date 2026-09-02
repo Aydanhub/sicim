@@ -36,6 +36,7 @@ async def test_child_result_is_replayed_after_parent_crash(store):
     child_record = await rt2.status("P1.c0")  # deterministic child run id
     assert child_record.status is RunStatus.COMPLETED
     assert child_record.result == 36
+    assert child_record.parent_run_id == "P1"  # persisted parent linkage
     await rt2.shutdown()
 
 

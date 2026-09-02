@@ -81,6 +81,53 @@ async def test_signal_and_cancel_follow_the_chain(rt):
     assert await handle.result() == {"ok": True}
 
 
+async def test_chain_keep_prunes_old_link_histories(store):
+    @workflow(name="wf_can_autoprune")
+    async def wf(ctx, n):
+        if n > 0:
+            await ctx.continue_as_new(n - 1)
+        return await ctx.wait_event("finish")
+
+    rt = Runtime(store, chain_keep=1)
+    handle = await rt.start(wf, 3, run_id="ap")  # ap -> ap#2 -> ap#3 -> ap#4 (live)
+    await wait_for_events(store, "ap#4", Kind.WAIT_CREATED, 1)
+
+    # Run records stay behind for routing, but only the newest finished link
+    # keeps its journal — that is what bounds storage for infinite agents.
+    assert await store.load_events("ap") == []
+    assert await store.load_events("ap#2") == []
+    assert len(await store.load_events("ap#3")) > 0
+    for run_id in ("ap", "ap#2", "ap#3"):
+        assert (await rt.status(run_id)).status is RunStatus.CONTINUED
+
+    # Old ids still route to the live run, and the original handle still follows.
+    await rt.signal("ap", "finish", {"ok": True})
+    assert await handle.result() == {"ok": True}
+    await rt.shutdown()
+
+
+async def test_chain_keep_zero_keeps_only_the_live_journal(store):
+    @workflow(name="wf_can_autoprune0")
+    async def wf(ctx, n):
+        if n > 0:
+            await ctx.continue_as_new(n - 1)
+        return "end"
+
+    rt = Runtime(store, chain_keep=0)
+    handle = await rt.start(wf, 2, run_id="zp")  # zp -> zp#2 -> zp#3
+    assert await handle.result() == "end"
+
+    assert await store.load_events("zp") == []
+    assert await store.load_events("zp#2") == []
+    assert (await rt.status("zp")).status is RunStatus.CONTINUED
+    assert (await rt.status("zp#3")).result == "end"
+
+    # A late result() from the original id still walks the pruned chain.
+    late = await rt.resume("zp")
+    assert await late.result() == "end"
+    await rt.shutdown()
+
+
 async def test_continued_runs_are_prunable_history(rt):
     @workflow(name="wf_can_prune")
     async def wf(ctx, n):

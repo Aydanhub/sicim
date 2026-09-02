@@ -1,8 +1,11 @@
-"""SQLite durability across store instances (real process-restart semantics)."""
+"""Store behaviour: durability, deletion, migrations, PostgreSQL reconnect."""
 
+import sqlite3
+
+import pytest
 from helpers import Gate, counting_step
 
-from sicim import Runtime, RunStatus, SQLiteStore, workflow
+from sicim import Event, Runtime, RunRecord, RunStatus, SQLiteStore, workflow
 
 
 async def test_sqlite_survives_store_reopen(tmp_path):
@@ -59,6 +62,59 @@ async def test_delete_run_removes_everything(store):
     assert await store.load_events("del1") == []
     assert await store.load_signals("del1") == []
     assert await store.load_lease("del1") is None
+
+
+async def test_delete_run_history_keeps_the_record(store):
+    await store.create_run(RunRecord(run_id="H1", workflow="w"))
+    await store.append_event("H1", Event(seq=0, kind="run_started", op_id=-1, payload={}, ts=1.0))
+    await store.append_signal("H1", "go", {"x": 1})
+
+    await store.delete_run_history("H1")
+
+    assert (await store.load_run("H1")) is not None
+    assert await store.load_events("H1") == []
+    assert await store.load_signals("H1") == []
+
+
+async def test_parent_run_id_roundtrips(store):
+    await store.create_run(RunRecord(run_id="child", workflow="w", parent_run_id="papa"))
+    loaded = await store.load_run("child")
+    assert loaded.parent_run_id == "papa"
+    assert (await store.list_runs())[0].parent_run_id == "papa"
+
+
+async def test_sqlite_migrates_pre_04_schema(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE runs (run_id TEXT PRIMARY KEY, workflow TEXT NOT NULL,"
+        " version INTEGER NOT NULL DEFAULT 1, args TEXT NOT NULL, kwargs TEXT NOT NULL,"
+        " status TEXT NOT NULL, result TEXT, error TEXT,"
+        " cancel_requested INTEGER NOT NULL DEFAULT 0, continued_to TEXT,"
+        " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = SQLiteStore(path)  # adds the parent_run_id column on open
+    await store.create_run(RunRecord(run_id="m1", workflow="w", parent_run_id="papa"))
+    assert (await store.load_run("m1")).parent_run_id == "papa"
+    store.close()
+
+
+async def test_postgres_reconnects_after_connection_loss(store):
+    from sicim.pg import PostgresStore
+
+    if not isinstance(store, PostgresStore):
+        pytest.skip("postgres-only behaviour")
+
+    await store._conn.close()  # simulate a dropped server connection
+    assert await store.load_run("missing") is None  # read path reconnects
+
+    await store._conn.close()
+    seq = await store.append_signal("R", "go", {"x": 1})  # write path reconnects
+    assert seq == 0
+    assert [s.payload for s in await store.load_signals("R")] == [{"x": 1}]
 
 
 async def test_sqlite_signal_roundtrip(tmp_path):

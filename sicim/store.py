@@ -3,8 +3,6 @@
 A Store persists three things per run: the run record (inputs, status,
 outcome), the journal events, and the signal inbox. ``InMemoryStore`` is for
 tests and ephemeral use; ``SQLiteStore`` (WAL mode) is the durable default.
-
-v0.1 assumes a single Runtime drives a given run at a time (no leasing).
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from . import serde
 from .journal import Event
@@ -52,6 +50,9 @@ class RunRecord:
     error: dict[str, Any] | None = None
     cancel_requested: bool = False
     continued_to: str | None = None
+    #: Run id of the parent workflow for child runs (``ctx.child``); carried
+    #: through continue-as-new successors. None for top-level runs.
+    parent_run_id: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -91,6 +92,15 @@ class Store(abc.ABC):
         """Remove a run and everything attached to it (events, signals, lease)."""
 
     @abc.abstractmethod
+    async def delete_run_history(self, run_id: str) -> None:
+        """Delete a run's journal and signal inbox but keep its run record.
+
+        Used by automatic chain pruning: an old continue-as-new link keeps its
+        (tiny) record so signal/cancel/result routing by old run ids still
+        works, while the storage-heavy history is dropped.
+        """
+
+    @abc.abstractmethod
     async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]: ...
 
     @abc.abstractmethod
@@ -124,6 +134,22 @@ class Store(abc.ABC):
     @abc.abstractmethod
     async def load_lease(self, run_id: str) -> tuple[str, float] | None:
         """Current ``(owner, expires_at)`` for the run, or None."""
+
+    # -- push notifications --------------------------------------------------
+
+    async def subscribe(
+        self, on_notify: Callable[[str, str], None]
+    ) -> Callable[[], Awaitable[None]] | None:
+        """Open a push channel for cross-worker wakeups, if the backend has one.
+
+        Backends with a broadcast mechanism (PostgreSQL LISTEN/NOTIFY) invoke
+        ``on_notify(kind, run_id)`` — kind ``"signal"`` or ``"cancel"`` — for
+        every relevant write by *any* worker sharing the database, and return
+        an async unsubscribe callable. The default returns None: no push
+        channel, callers rely on polling alone. Push is an optimization, never
+        a correctness requirement — polling stays as the backstop either way.
+        """
+        return None
 
     def close(self) -> None:  # noqa: B027 - optional hook
         pass
@@ -172,6 +198,10 @@ class InMemoryStore(Store):
         self._events.pop(run_id, None)
         self._signals.pop(run_id, None)
         self._leases.pop(run_id, None)
+
+    async def delete_run_history(self, run_id: str) -> None:
+        self._events.pop(run_id, None)
+        self._signals.pop(run_id, None)
 
     async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]:
         records = sorted(self._runs.values(), key=lambda r: r.created_at)
@@ -237,6 +267,7 @@ CREATE TABLE IF NOT EXISTS runs (
     error TEXT,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     continued_to TEXT,
+    parent_run_id TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -289,6 +320,8 @@ class SQLiteStore(Store):
                 self._conn.execute("ALTER TABLE runs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
             if "continued_to" not in columns:
                 self._conn.execute("ALTER TABLE runs ADD COLUMN continued_to TEXT")
+            if "parent_run_id" not in columns:
+                self._conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id TEXT")
             self._conn.commit()
 
     def close(self) -> None:
@@ -308,7 +341,8 @@ class SQLiteStore(Store):
         def op():
             self._conn.execute(
                 "INSERT INTO runs (run_id, workflow, version, args, kwargs, status, result, error,"
-                " cancel_requested, continued_to, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cancel_requested, continued_to, parent_run_id, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.run_id,
                     record.workflow,
@@ -320,6 +354,7 @@ class SQLiteStore(Store):
                     serde.encode(record.error),
                     int(record.cancel_requested),
                     record.continued_to,
+                    record.parent_run_id,
                     record.created_at,
                     record.updated_at,
                 ),
@@ -341,6 +376,7 @@ class SQLiteStore(Store):
             error=serde.decode(row["error"]) if row["error"] is not None else None,
             cancel_requested=bool(row["cancel_requested"]),
             continued_to=row["continued_to"],
+            parent_run_id=row["parent_run_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -382,6 +418,14 @@ class SQLiteStore(Store):
     async def delete_run(self, run_id: str) -> None:
         def op():
             for table in ("events", "signals", "leases", "runs"):
+                self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+            self._conn.commit()
+
+        await self._run(op)
+
+    async def delete_run_history(self, run_id: str) -> None:
+        def op():
+            for table in ("events", "signals"):
                 self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             self._conn.commit()
 

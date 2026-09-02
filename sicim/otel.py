@@ -11,7 +11,11 @@ Spans are derived from journal appends, so timings are the journal's own:
   terminal event, ERROR status on failure;
 * one child span per finished operation — step, timer, wait, child workflow,
   compensation — from its defining event to its completion, with attempt
-  counts and error details as attributes.
+  counts and error details as attributes;
+* a child workflow's run span is parented under the parent's run span (one
+  trace across the whole agent tree) and carries ``sicim.parent_run_id``. A
+  child resumed later by a *different* process cannot rejoin the original
+  trace — the attribute still correlates the runs there.
 
 Replayed operations never re-emit spans (replay does not append events). If a
 run crosses a process crash, operations whose defining event happened in the
@@ -43,6 +47,9 @@ def otel_observer(tracer: Any = None) -> Callable[[str, Event], None]:
     tracer = tracer or trace.get_tracer("sicim")
     run_spans: dict[str, Any] = {}
     op_starts: dict[tuple[str, int], Event] = {}
+    #: child_run_id -> parent's run span, recorded at CHILD_SCHEDULED so the
+    #: child's RUN_STARTED can join the parent's trace.
+    pending_children: dict[str, Any] = {}
 
     def ns(ts: float) -> int:
         return int(ts * 1_000_000_000)
@@ -74,14 +81,28 @@ def otel_observer(tracer: Any = None) -> Callable[[str, Event], None]:
     def observer(run_id: str, event: Event) -> None:
         kind, payload = event.kind, event.payload
         if kind == Kind.RUN_STARTED:
+            parent_span = pending_children.pop(run_id, None)
+            if parent_span is None and payload.get("parent"):
+                parent_span = run_spans.get(payload["parent"])
+            parent_context = (
+                trace.set_span_in_context(parent_span) if parent_span is not None else None
+            )
             span = tracer.start_span(
-                f"sicim.run {payload.get('workflow', '')}", start_time=ns(event.ts)
+                f"sicim.run {payload.get('workflow', '')}",
+                context=parent_context,
+                start_time=ns(event.ts),
             )
             span.set_attribute("sicim.run_id", run_id)
             span.set_attribute("sicim.workflow", payload.get("workflow", ""))
+            if payload.get("parent"):
+                span.set_attribute("sicim.parent_run_id", payload["parent"])
             run_spans[run_id] = span
         elif kind in _STARTING_KINDS:
             op_starts[(run_id, event.op_id)] = event
+            if kind == Kind.CHILD_SCHEDULED:
+                parent_run_span = run_spans.get(run_id)
+                if parent_run_span is not None:
+                    pending_children[payload["child_run_id"]] = parent_run_span
         elif kind == Kind.STEP_COMPLETED:
             emit_op(
                 run_id, event, f"sicim.step {payload.get('name', '')}",
@@ -103,11 +124,13 @@ def otel_observer(tracer: Any = None) -> Callable[[str, Event], None]:
                 error={"type": "WaitTimeout", "message": "no signal before deadline"},
             )
         elif kind == Kind.CHILD_COMPLETED:
+            pending_children.pop(payload.get("child_run_id", ""), None)
             emit_op(
                 run_id, event, f"sicim.child {payload.get('name', '')}",
                 attributes={"sicim.child_run_id": payload.get("child_run_id", "")},
             )
         elif kind == Kind.CHILD_FAILED:
+            pending_children.pop(payload.get("child_run_id", ""), None)
             emit_op(
                 run_id, event, f"sicim.child {payload.get('name', '')}",
                 error=payload.get("error", {}),

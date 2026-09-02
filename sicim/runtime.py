@@ -9,9 +9,6 @@ Lifecycle model:
   not currently in memory.
 * ``cancel()`` requests cancellation; the run stops at its next live operation,
   runs its compensations, and ends as CANCELLED.
-
-v0.1 assumes one Runtime drives a given run at a time (no cross-process
-leasing yet).
 """
 
 from __future__ import annotations
@@ -141,7 +138,17 @@ class Runtime:
 
     ``signal_poll_interval`` bounds how long a waiting run goes without
     re-scanning its signal inbox; it only matters for signals sent by another
-    worker (in-process signals wake the run immediately).
+    worker (in-process signals wake the run immediately). When the store
+    offers a push channel (``Store.subscribe``; PostgreSQL LISTEN/NOTIFY), a
+    driving Runtime subscribes to it and cross-worker signals/cancellations
+    arrive without waiting out the poll or the heartbeat — polling then remains
+    only as the backstop.
+
+    ``chain_keep`` turns on automatic continue-as-new chain pruning: after
+    each continue, only the newest ``chain_keep`` finished links keep their
+    journal and signal history; older links are reduced to their (tiny) run
+    records, which stay behind so signal/cancel/result routing by old run ids
+    keeps working. None (the default) prunes nothing.
 
     ``on_event`` is an observability hook called as ``on_event(run_id, event)``
     after every journal append; exceptions it raises are logged and ignored.
@@ -155,19 +162,25 @@ class Runtime:
         worker_id: str | None = None,
         lease_ttl: float = 30.0,
         signal_poll_interval: float = 1.0,
+        chain_keep: int | None = None,
         on_event: Callable[[str, Event], None] | None = None,
     ):
+        if chain_keep is not None and chain_keep < 0:
+            raise ValueError("chain_keep must be None or an int >= 0")
         self.store = store or InMemoryStore()
         self.default_retry = default_retry or RetryPolicy()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.lease_ttl = lease_ttl
         self.signal_poll_interval = signal_poll_interval
+        self.chain_keep = chain_keep
         self.on_event = on_event
         self._handles: dict[str, RunHandle] = {}
         self._waiters: dict[str, set[asyncio.Future]] = {}
         self._cancel_flags: dict[str, bool] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._spawn_lock = asyncio.Lock()
+        self._subscription: Callable[[], Any] | None = None
+        self._subscribe_attempted = False
         self._closing = False
 
     # -- public API ----------------------------------------------------------
@@ -176,6 +189,17 @@ class Runtime:
         """Start a run. Idempotent on ``run_id``: if the run already exists (for
         the same workflow), it is resumed with its *stored* inputs and the new
         arguments are ignored."""
+        return await self._start(wf, args, kwargs, run_id=run_id, parent_run_id=None)
+
+    async def _start(
+        self,
+        wf: WorkflowFn,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        run_id: str | None,
+        parent_run_id: str | None,
+    ) -> RunHandle:
         name = workflow_name(wf)
         run_id = run_id or uuid.uuid4().hex
         existing = await self.store.load_run(run_id)
@@ -192,6 +216,7 @@ class Runtime:
             version=workflow_version(wf),
             args=serde.roundtrip(list(args)) or [],
             kwargs=serde.roundtrip(kwargs) or {},
+            parent_run_id=parent_run_id,
         )
         await self.store.create_run(record)
         logger.info("[%s] started workflow '%s'", run_id, name)
@@ -277,6 +302,10 @@ class Runtime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self._subscription is not None:
+            subscription, self._subscription = self._subscription, None
+            with contextlib.suppress(BaseException):
+                await subscription()
         for waiters in self._waiters.values():
             for fut in waiters:
                 if not fut.done():
@@ -307,6 +336,41 @@ class Runtime:
             seen.add(record.run_id)
         return record
 
+    async def _prune_chain(self, tail_id: str, workflow: str) -> None:
+        """Automatic chain pruning (``chain_keep=N``): keep full history for
+        the newest N finished links behind the live run ``tail_id``; older
+        links lose their journal and signal inbox but keep their run records,
+        so routing by old run ids stays intact. Only records that provably
+        belong to the chain (CONTINUED, forward-linked, same workflow) are
+        touched; failures are logged, never raised — pruning is maintenance,
+        not part of the run's outcome.
+        """
+        try:
+            child_id, kept = tail_id, 0
+            while True:
+                match = _CHAIN_RE.match(child_id)
+                if not match:
+                    return  # reached the chain root
+                n = int(match.group("n"))
+                pred_id = f"{match.group('base')}#{n - 1}" if n > 2 else match.group("base")
+                pred = await self.store.load_run(pred_id)
+                if (
+                    pred is None
+                    or pred.status is not RunStatus.CONTINUED
+                    or pred.continued_to != child_id
+                    or pred.workflow != workflow
+                ):
+                    return
+                kept += 1
+                if kept > self.chain_keep:
+                    if not await self.store.load_events(pred_id):
+                        return  # already pruned earlier -> everything older is too
+                    await self.store.delete_run_history(pred_id)
+                    logger.info("[%s] pruned chain history (record kept for routing)", pred_id)
+                child_id = pred_id
+        except Exception:
+            logger.exception("chain pruning behind '%s' failed; continuing", tail_id)
+
     async def _ensure(self, record: RunRecord) -> RunHandle:
         """Get the live handle for a run, spawning its driver task if needed."""
         async with self._spawn_lock:
@@ -320,6 +384,7 @@ class Runtime:
             if not await self.store.try_acquire_lease(record.run_id, self.worker_id, self.lease_ttl):
                 lease = await self.store.load_lease(record.run_id)
                 raise LeaseUnavailable(record.run_id, lease[0] if lease else None)
+            await self._ensure_subscribed()
             wf = get_workflow(record.workflow)
             events = await self.store.load_events(record.run_id)
             journal = Journal(record.run_id, self.store, events, on_append=self.on_event)
@@ -359,9 +424,10 @@ class Runtime:
             self._heartbeat(run_id, asyncio.current_task()), name=f"sicim-lease:{run_id}"
         )
         try:
-            await journal.append_once(
-                Kind.RUN_STARTED, -1, {"workflow": record.workflow, "args": serde.preview(record.args)}
-            )
+            started = {"workflow": record.workflow, "args": serde.preview(record.args)}
+            if record.parent_run_id:
+                started["parent"] = record.parent_run_id
+            await journal.append_once(Kind.RUN_STARTED, -1, started)
             try:
                 result = await wf(ctx, *record.args, **record.kwargs)
                 result = serde.roundtrip(result)
@@ -403,10 +469,13 @@ class Runtime:
                             version=workflow_version(wf),  # upgrade point: current code's version
                             args=cont.next_args,
                             kwargs=cont.next_kwargs,
+                            parent_run_id=record.parent_run_id,
                         )
                     )
                 await self.store.update_run(run_id, status=RunStatus.CONTINUED, continued_to=next_id)
                 logger.info("[%s] continued as '%s'", run_id, next_id)
+                if self.chain_keep is not None:
+                    await self._prune_chain(next_id, record.workflow)
                 next_record = await self.store.load_run(next_id)
                 if next_record is not None and not next_record.status.terminal:
                     with contextlib.suppress(LeaseUnavailable):
@@ -474,6 +543,29 @@ class Runtime:
                     self._cancel_flags[run_id] = True
                     self._cancel_event(run_id).set()
                     self._wake(run_id)
+
+    async def _ensure_subscribed(self) -> None:
+        """Open the store's push channel (if it has one), once per Runtime.
+
+        Push delivers cross-worker signals and cancellations instantly;
+        subscribing lazily — on the first driven run — keeps signal-only
+        Runtimes from holding listener connections. Failure falls back to
+        polling.
+        """
+        if self._subscribe_attempted:
+            return
+        self._subscribe_attempted = True
+        try:
+            self._subscription = await self.store.subscribe(self._on_store_notify)
+        except Exception:
+            logger.exception("store subscribe failed; relying on polling")
+
+    def _on_store_notify(self, kind: str, run_id: str) -> None:
+        """Dispatch a store push notification (see ``Store.subscribe``)."""
+        if kind == "cancel" and run_id in self._cancel_flags:  # we drive this run
+            self._cancel_flags[run_id] = True
+            self._cancel_event(run_id).set()
+        self._wake(run_id)
 
     # -- hooks used by WorkflowContext ---------------------------------------
 

@@ -456,7 +456,9 @@ class WorkflowContext:
 
         # Live: start (or re-attach to) the child run and await it, staying
         # responsive to cooperative cancellation of the parent.
-        handle = await self._runtime.start(wf, *args, run_id=child_run_id, **kwargs)
+        handle = await self._runtime._start(
+            wf, args, kwargs, run_id=child_run_id, parent_run_id=self.run_id
+        )
         result_task = asyncio.ensure_future(handle.result())
         cancel_task = asyncio.ensure_future(self._runtime._cancel_event(self.run_id).wait())
         try:

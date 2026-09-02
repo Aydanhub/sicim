@@ -48,6 +48,35 @@ async def test_run_and_step_spans_are_linked(store):
     assert step_span.end_time >= step_span.start_time
 
 
+async def test_child_run_span_joins_the_parents_trace(store):
+    tracer, exporter = make_tracer()
+    rt = Runtime(store, on_event=otel_observer(tracer))
+
+    @workflow(name="wf_otel_child")
+    async def child(ctx):
+        await ctx.step(ok_step, name="inner")
+        return "c"
+
+    @workflow(name="wf_otel_parent")
+    async def parent(ctx):
+        return await ctx.child(child)
+
+    handle = await rt.start(parent, run_id="otp")
+    assert await handle.result() == "c"
+    await rt.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    parent_run = spans["sicim.run wf_otel_parent"]
+    child_run = spans["sicim.run wf_otel_child"]
+    assert child_run.parent is not None
+    assert child_run.parent.span_id == parent_run.context.span_id
+    assert child_run.context.trace_id == parent_run.context.trace_id
+    assert child_run.attributes["sicim.parent_run_id"] == "otp"
+    # The whole agent tree lands in one trace, inner step included.
+    assert spans["sicim.step inner"].context.trace_id == parent_run.context.trace_id
+    assert spans["sicim.child wf_otel_child"].context.trace_id == parent_run.context.trace_id
+
+
 async def test_failed_run_span_has_error_status(store):
     tracer, exporter = make_tracer()
     rt = Runtime(store, on_event=otel_observer(tracer))
