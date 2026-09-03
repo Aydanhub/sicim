@@ -27,6 +27,10 @@ class RunNotFound(SicimError):
     """No run exists with the requested run_id."""
 
 
+class ScheduleNotFound(SicimError):
+    """No schedule exists with the requested schedule_id."""
+
+
 class NonDeterminismError(SicimError):
     """Replay diverged from the recorded journal.
 

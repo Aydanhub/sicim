@@ -94,7 +94,7 @@ async def store(request, tmp_path, pg_dsn):
 
         backend = await PostgresStore.connect(pg_dsn)
         # The cluster is session-scoped; isolate each test by clearing tables.
-        for table in ("events", "signals", "leases", "runs"):
+        for table in ("events", "signals", "run_tags", "leases", "runs", "schedules"):
             await backend._conn.execute(f"DELETE FROM {table}")
     yield backend
     await backend.aclose()

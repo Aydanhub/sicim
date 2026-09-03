@@ -12,6 +12,7 @@ from .errors import (
     NonDeterminismError,
     NonRetryable,
     RunNotFound,
+    ScheduleNotFound,
     SerializationError,
     SicimError,
     StepFailed,
@@ -23,10 +24,18 @@ from .errors import (
 from .journal import Event, Kind
 from .retry import NO_RETRY, RetryPolicy
 from .runtime import RunHandle, Runtime
-from .store import InMemoryStore, RunRecord, RunStatus, SignalRecord, SQLiteStore, Store
+from .store import (
+    InMemoryStore,
+    RunRecord,
+    RunStatus,
+    ScheduleRecord,
+    SignalRecord,
+    SQLiteStore,
+    Store,
+)
 from .workflow import get_workflow, workflow
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "ChildFailed",
@@ -45,6 +54,8 @@ __all__ = [
     "RunStatus",
     "Runtime",
     "SQLiteStore",
+    "ScheduleNotFound",
+    "ScheduleRecord",
     "SerializationError",
     "SicimError",
     "SignalRecord",

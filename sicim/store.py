@@ -1,8 +1,9 @@
 """Storage backends.
 
-A Store persists three things per run: the run record (inputs, status,
-outcome), the journal events, and the signal inbox. ``InMemoryStore`` is for
-tests and ephemeral use; ``SQLiteStore`` (WAL mode) is the durable default.
+A Store persists, per run: the run record (inputs, tags, status, outcome), the
+journal events and the signal inbox — plus worker leases and the schedule
+table. ``InMemoryStore`` is for tests and ephemeral use; ``SQLiteStore`` (WAL
+mode) is the durable default.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from . import serde
 from .journal import Event
@@ -38,6 +39,27 @@ class RunStatus(str, enum.Enum):
         return self is not RunStatus.RUNNING
 
 
+def validate_tags(tags: Mapping[str, str] | None) -> dict[str, str]:
+    """Normalize run/schedule tags: a flat ``str -> str`` mapping.
+
+    Tags are search keys (``list_runs(tags={...})``) pinned when a run is
+    created. Keys starting with ``sicim.`` are reserved for the runtime
+    (``sicim.schedule`` marks runs started by a schedule).
+    """
+    if tags is None:
+        return {}
+    if not isinstance(tags, Mapping):
+        raise TypeError("tags must be a mapping of str -> str")
+    normalized: dict[str, str] = {}
+    for key, value in tags.items():
+        if not isinstance(key, str) or not key:
+            raise TypeError("tag keys must be non-empty strings")
+        if not isinstance(value, str):
+            raise TypeError(f"tag {key!r} must map to a string, got {type(value).__name__}")
+        normalized[key] = value
+    return normalized
+
+
 @dataclass
 class RunRecord:
     run_id: str
@@ -53,6 +75,9 @@ class RunRecord:
     #: Run id of the parent workflow for child runs (``ctx.child``); carried
     #: through continue-as-new successors. None for top-level runs.
     parent_run_id: str | None = None
+    #: Search tags pinned at start (``Runtime.start(tags=...)``). Child runs
+    #: inherit them by default; continue-as-new successors carry them.
+    tags: dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -66,11 +91,38 @@ class SignalRecord:
     ts: float
 
 
+@dataclass
+class ScheduleRecord:
+    """A standing instruction to start runs of a workflow on a schedule.
+
+    ``spec`` is the serialized schedule (``"every 3600"``, ``"at <ts>"`` or
+    ``"cron <expr>"``, see :mod:`sicim.schedule`); ``next_fire_at`` the next
+    planned start (None once a one-shot schedule has fired); ``last_run_id``
+    the most recently started run. ``overlap`` is ``"skip"`` (a tick is skipped
+    while the previous run is still running) or ``"allow"``.
+    """
+
+    schedule_id: str
+    workflow: str
+    spec: str
+    args: list[Any] = field(default_factory=list)
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    tz: str | None = None
+    tags: dict[str, str] = field(default_factory=dict)
+    overlap: str = "skip"
+    paused: bool = False
+    next_fire_at: float | None = None
+    last_run_id: str | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
 class Store(abc.ABC):
     """Async persistence interface."""
 
     @abc.abstractmethod
-    async def create_run(self, record: RunRecord) -> None: ...
+    async def create_run(self, record: RunRecord) -> None:
+        """Insert a new run; raises if ``record.run_id`` already exists."""
 
     @abc.abstractmethod
     async def load_run(self, run_id: str) -> RunRecord | None: ...
@@ -89,7 +141,7 @@ class Store(abc.ABC):
 
     @abc.abstractmethod
     async def delete_run(self, run_id: str) -> None:
-        """Remove a run and everything attached to it (events, signals, lease)."""
+        """Remove a run and everything attached to it (events, signals, tags, lease)."""
 
     @abc.abstractmethod
     async def delete_run_history(self, run_id: str) -> None:
@@ -101,7 +153,19 @@ class Store(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]: ...
+    async def list_runs(
+        self,
+        status: RunStatus | None = None,
+        *,
+        workflow: str | None = None,
+        tags: Mapping[str, str] | None = None,
+        parent_run_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[RunRecord]:
+        """Search runs. Every given filter must match; ``tags`` means *all* of
+        the given pairs. Ordered by creation time, oldest first unless
+        ``newest_first``; ``limit`` caps the result."""
 
     @abc.abstractmethod
     async def append_event(self, run_id: str, event: Event) -> None: ...
@@ -135,6 +199,42 @@ class Store(abc.ABC):
     async def load_lease(self, run_id: str) -> tuple[str, float] | None:
         """Current ``(owner, expires_at)`` for the run, or None."""
 
+    # -- schedules -----------------------------------------------------------
+
+    @abc.abstractmethod
+    async def create_schedule(self, record: ScheduleRecord) -> None:
+        """Insert a schedule; raises if ``record.schedule_id`` already exists."""
+
+    @abc.abstractmethod
+    async def load_schedule(self, schedule_id: str) -> ScheduleRecord | None: ...
+
+    @abc.abstractmethod
+    async def list_schedules(self) -> list[ScheduleRecord]: ...
+
+    @abc.abstractmethod
+    async def list_due_schedules(self, now: float) -> list[ScheduleRecord]:
+        """Unpaused schedules whose ``next_fire_at`` is at or before ``now``."""
+
+    @abc.abstractmethod
+    async def update_schedule(
+        self,
+        schedule_id: str,
+        *,
+        expected_next_fire_at: float | None | Any = _UNSET,
+        paused: bool | Any = _UNSET,
+        next_fire_at: float | None | Any = _UNSET,
+        last_run_id: str | None | Any = _UNSET,
+    ) -> bool:
+        """Update a schedule; returns whether a row changed.
+
+        With ``expected_next_fire_at`` the update is a compare-and-set on the
+        current ``next_fire_at`` — the scheduler uses it so that, of several
+        workers seeing the same due tick, exactly one advances the schedule.
+        """
+
+    @abc.abstractmethod
+    async def delete_schedule(self, schedule_id: str) -> None: ...
+
     # -- push notifications --------------------------------------------------
 
     async def subscribe(
@@ -159,6 +259,118 @@ class Store(abc.ABC):
         self.close()
 
 
+# -- SQL helpers shared by the SQLite and PostgreSQL backends -----------------
+
+
+def _run_query(
+    placeholder: str,
+    status: RunStatus | None,
+    workflow: str | None,
+    tags: Mapping[str, str] | None,
+    parent_run_id: str | None,
+    limit: int | None,
+    newest_first: bool,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        clauses.append(f"status = {placeholder}")
+        params.append(status.value)
+    if workflow is not None:
+        clauses.append(f"workflow = {placeholder}")
+        params.append(workflow)
+    if parent_run_id is not None:
+        clauses.append(f"parent_run_id = {placeholder}")
+        params.append(parent_run_id)
+    for key, value in (tags or {}).items():
+        clauses.append(
+            "EXISTS (SELECT 1 FROM run_tags WHERE run_tags.run_id = runs.run_id"
+            f" AND run_tags.tag_key = {placeholder} AND run_tags.tag_value = {placeholder})"
+        )
+        params.extend((key, value))
+    sql = "SELECT * FROM runs"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    direction = "DESC" if newest_first else "ASC"
+    sql += f" ORDER BY created_at {direction}, run_id {direction}"
+    if limit is not None:
+        sql += f" LIMIT {placeholder}"
+        params.append(int(limit))
+    return sql, params
+
+
+_SCHEDULE_COLUMNS = (
+    "schedule_id, workflow, spec, args, kwargs, tz, tags, overlap, paused,"
+    " next_fire_at, last_run_id, created_at, updated_at"
+)
+
+
+def _schedule_params(record: ScheduleRecord) -> tuple[Any, ...]:
+    return (
+        record.schedule_id,
+        record.workflow,
+        record.spec,
+        serde.encode(record.args),
+        serde.encode(record.kwargs),
+        record.tz,
+        serde.encode(record.tags),
+        record.overlap,
+        int(record.paused),
+        record.next_fire_at,
+        record.last_run_id,
+        record.created_at,
+        record.updated_at,
+    )
+
+
+def _schedule_from_row(row: Any) -> ScheduleRecord:
+    return ScheduleRecord(
+        schedule_id=row["schedule_id"],
+        workflow=row["workflow"],
+        spec=row["spec"],
+        args=serde.decode(row["args"]),
+        kwargs=serde.decode(row["kwargs"]),
+        tz=row["tz"],
+        tags=serde.decode(row["tags"]) if row["tags"] else {},
+        overlap=row["overlap"],
+        paused=bool(row["paused"]),
+        next_fire_at=row["next_fire_at"],
+        last_run_id=row["last_run_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _schedule_update(
+    placeholder: str,
+    schedule_id: str,
+    *,
+    expected_next_fire_at: Any,
+    paused: Any,
+    next_fire_at: Any,
+    last_run_id: Any,
+) -> tuple[str, list[Any]]:
+    sets, params = [f"updated_at = {placeholder}"], [time.time()]
+    if paused is not _UNSET:
+        sets.append(f"paused = {placeholder}")
+        params.append(int(paused))
+    if next_fire_at is not _UNSET:
+        sets.append(f"next_fire_at = {placeholder}")
+        params.append(next_fire_at)
+    if last_run_id is not _UNSET:
+        sets.append(f"last_run_id = {placeholder}")
+        params.append(last_run_id)
+    where = f"schedule_id = {placeholder}"
+    params.append(schedule_id)
+    if expected_next_fire_at is not _UNSET:
+        if expected_next_fire_at is None:
+            where += " AND next_fire_at IS NULL"
+        else:
+            where += f" AND next_fire_at = {placeholder}"
+            params.append(expected_next_fire_at)
+    return f"UPDATE schedules SET {', '.join(sets)} WHERE {where}", params
+
+
 class InMemoryStore(Store):
     """Non-durable store for tests and throwaway runs."""
 
@@ -167,15 +379,22 @@ class InMemoryStore(Store):
         self._events: dict[str, list[Event]] = {}
         self._signals: dict[str, list[SignalRecord]] = {}
         self._leases: dict[str, tuple[str, float]] = {}
+        self._schedules: dict[str, ScheduleRecord] = {}
+
+    @staticmethod
+    def _copy(record: RunRecord) -> RunRecord:
+        return dataclasses.replace(record, tags=dict(record.tags))
 
     async def create_run(self, record: RunRecord) -> None:
-        self._runs[record.run_id] = dataclasses.replace(record)
+        if record.run_id in self._runs:
+            raise ValueError(f"run '{record.run_id}' already exists")
+        self._runs[record.run_id] = self._copy(record)
         self._events.setdefault(record.run_id, [])
         self._signals.setdefault(record.run_id, [])
 
     async def load_run(self, run_id: str) -> RunRecord | None:
         record = self._runs.get(run_id)
-        return dataclasses.replace(record) if record is not None else None
+        return self._copy(record) if record is not None else None
 
     async def update_run(
         self, run_id, *, status=_UNSET, result=_UNSET, error=_UNSET, cancel_requested=_UNSET, continued_to=_UNSET
@@ -203,11 +422,24 @@ class InMemoryStore(Store):
         self._events.pop(run_id, None)
         self._signals.pop(run_id, None)
 
-    async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]:
-        records = sorted(self._runs.values(), key=lambda r: r.created_at)
-        if status is not None:
-            records = [r for r in records if r.status == status]
-        return [dataclasses.replace(r) for r in records]
+    async def list_runs(
+        self, status=None, *, workflow=None, tags=None, parent_run_id=None, limit=None, newest_first=False
+    ) -> list[RunRecord]:
+        records = sorted(self._runs.values(), key=lambda r: (r.created_at, r.run_id), reverse=newest_first)
+        selected: list[RunRecord] = []
+        for record in records:
+            if status is not None and record.status != status:
+                continue
+            if workflow is not None and record.workflow != workflow:
+                continue
+            if parent_run_id is not None and record.parent_run_id != parent_run_id:
+                continue
+            if tags and any(record.tags.get(key) != value for key, value in tags.items()):
+                continue
+            selected.append(self._copy(record))
+            if limit is not None and len(selected) >= limit:
+                break
+        return selected
 
     async def append_event(self, run_id: str, event: Event) -> None:
         self._events.setdefault(run_id, []).append(event)
@@ -254,6 +486,53 @@ class InMemoryStore(Store):
     async def load_lease(self, run_id: str) -> tuple[str, float] | None:
         return self._leases.get(run_id)
 
+    # -- schedules -----------------------------------------------------------
+
+    @staticmethod
+    def _copy_schedule(record: ScheduleRecord) -> ScheduleRecord:
+        return dataclasses.replace(record, tags=dict(record.tags))
+
+    async def create_schedule(self, record: ScheduleRecord) -> None:
+        if record.schedule_id in self._schedules:
+            raise ValueError(f"schedule '{record.schedule_id}' already exists")
+        self._schedules[record.schedule_id] = self._copy_schedule(record)
+
+    async def load_schedule(self, schedule_id: str) -> ScheduleRecord | None:
+        record = self._schedules.get(schedule_id)
+        return self._copy_schedule(record) if record is not None else None
+
+    async def list_schedules(self) -> list[ScheduleRecord]:
+        records = sorted(self._schedules.values(), key=lambda s: (s.created_at, s.schedule_id))
+        return [self._copy_schedule(r) for r in records]
+
+    async def list_due_schedules(self, now: float) -> list[ScheduleRecord]:
+        due = [
+            s for s in self._schedules.values()
+            if not s.paused and s.next_fire_at is not None and s.next_fire_at <= now
+        ]
+        due.sort(key=lambda s: (s.next_fire_at, s.schedule_id))
+        return [self._copy_schedule(s) for s in due]
+
+    async def update_schedule(
+        self, schedule_id, *, expected_next_fire_at=_UNSET, paused=_UNSET, next_fire_at=_UNSET, last_run_id=_UNSET
+    ) -> bool:
+        record = self._schedules.get(schedule_id)
+        if record is None:
+            return False
+        if expected_next_fire_at is not _UNSET and record.next_fire_at != expected_next_fire_at:
+            return False
+        if paused is not _UNSET:
+            record.paused = paused
+        if next_fire_at is not _UNSET:
+            record.next_fire_at = next_fire_at
+        if last_run_id is not _UNSET:
+            record.last_run_id = last_run_id
+        record.updated_at = time.time()
+        return True
+
+    async def delete_schedule(self, schedule_id: str) -> None:
+        self._schedules.pop(schedule_id, None)
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -268,8 +547,15 @@ CREATE TABLE IF NOT EXISTS runs (
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     continued_to TEXT,
     parent_run_id TEXT,
+    tags TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_tags (
+    run_id TEXT NOT NULL,
+    tag_key TEXT NOT NULL,
+    tag_value TEXT NOT NULL,
+    PRIMARY KEY (run_id, tag_key)
 );
 CREATE TABLE IF NOT EXISTS leases (
     run_id TEXT PRIMARY KEY,
@@ -294,7 +580,25 @@ CREATE TABLE IF NOT EXISTS signals (
     ts REAL NOT NULL,
     PRIMARY KEY (run_id, seq)
 );
+CREATE TABLE IF NOT EXISTS schedules (
+    schedule_id TEXT PRIMARY KEY,
+    workflow TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    args TEXT NOT NULL,
+    kwargs TEXT NOT NULL,
+    tz TEXT,
+    tags TEXT NOT NULL DEFAULT '{}',
+    overlap TEXT NOT NULL DEFAULT 'skip',
+    paused INTEGER NOT NULL DEFAULT 0,
+    next_fire_at REAL,
+    last_run_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_workflow ON runs(workflow);
+CREATE INDEX IF NOT EXISTS idx_run_tags_kv ON run_tags(tag_key, tag_value);
+CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(next_fire_at);
 """
 
 
@@ -322,6 +626,8 @@ class SQLiteStore(Store):
                 self._conn.execute("ALTER TABLE runs ADD COLUMN continued_to TEXT")
             if "parent_run_id" not in columns:
                 self._conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id TEXT")
+            if "tags" not in columns:
+                self._conn.execute("ALTER TABLE runs ADD COLUMN tags TEXT NOT NULL DEFAULT '{}'")
             self._conn.commit()
 
     def close(self) -> None:
@@ -331,7 +637,13 @@ class SQLiteStore(Store):
     async def _run(self, fn, *args):
         def call():
             with self._lock:
-                return fn(*args)
+                try:
+                    return fn(*args)
+                except Exception:
+                    # Leave no half-open transaction behind on the shared
+                    # connection (e.g. after a primary-key conflict).
+                    self._conn.rollback()
+                    raise
 
         return await asyncio.to_thread(call)
 
@@ -341,8 +653,8 @@ class SQLiteStore(Store):
         def op():
             self._conn.execute(
                 "INSERT INTO runs (run_id, workflow, version, args, kwargs, status, result, error,"
-                " cancel_requested, continued_to, parent_run_id, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cancel_requested, continued_to, parent_run_id, tags, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.run_id,
                     record.workflow,
@@ -355,10 +667,16 @@ class SQLiteStore(Store):
                     int(record.cancel_requested),
                     record.continued_to,
                     record.parent_run_id,
+                    serde.encode(record.tags),
                     record.created_at,
                     record.updated_at,
                 ),
             )
+            if record.tags:
+                self._conn.executemany(
+                    "INSERT INTO run_tags (run_id, tag_key, tag_value) VALUES (?,?,?)",
+                    [(record.run_id, key, value) for key, value in record.tags.items()],
+                )
             self._conn.commit()
 
         await self._run(op)
@@ -377,6 +695,7 @@ class SQLiteStore(Store):
             cancel_requested=bool(row["cancel_requested"]),
             continued_to=row["continued_to"],
             parent_run_id=row["parent_run_id"],
+            tags=serde.decode(row["tags"]) if row["tags"] else {},
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -417,7 +736,7 @@ class SQLiteStore(Store):
 
     async def delete_run(self, run_id: str) -> None:
         def op():
-            for table in ("events", "signals", "leases", "runs"):
+            for table in ("events", "signals", "run_tags", "leases", "runs"):
                 self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             self._conn.commit()
 
@@ -431,15 +750,13 @@ class SQLiteStore(Store):
 
         await self._run(op)
 
-    async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]:
+    async def list_runs(
+        self, status=None, *, workflow=None, tags=None, parent_run_id=None, limit=None, newest_first=False
+    ) -> list[RunRecord]:
+        sql, params = _run_query("?", status, workflow, tags, parent_run_id, limit, newest_first)
+
         def op():
-            if status is None:
-                rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at").fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT * FROM runs WHERE status = ? ORDER BY created_at", (status.value,)
-                ).fetchall()
-            return [self._row_to_record(r) for r in rows]
+            return [self._row_to_record(r) for r in self._conn.execute(sql, params).fetchall()]
 
         return await self._run(op)
 
@@ -553,3 +870,68 @@ class SQLiteStore(Store):
             return (row["owner"], row["expires_at"]) if row else None
 
         return await self._run(op)
+
+    # -- schedules -----------------------------------------------------------
+
+    async def create_schedule(self, record: ScheduleRecord) -> None:
+        params = _schedule_params(record)
+
+        def op():
+            self._conn.execute(
+                f"INSERT INTO schedules ({_SCHEDULE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", params
+            )
+            self._conn.commit()
+
+        await self._run(op)
+
+    async def load_schedule(self, schedule_id: str) -> ScheduleRecord | None:
+        def op():
+            row = self._conn.execute(
+                "SELECT * FROM schedules WHERE schedule_id = ?", (schedule_id,)
+            ).fetchone()
+            return _schedule_from_row(row) if row else None
+
+        return await self._run(op)
+
+    async def list_schedules(self) -> list[ScheduleRecord]:
+        def op():
+            rows = self._conn.execute(
+                "SELECT * FROM schedules ORDER BY created_at, schedule_id"
+            ).fetchall()
+            return [_schedule_from_row(r) for r in rows]
+
+        return await self._run(op)
+
+    async def list_due_schedules(self, now: float) -> list[ScheduleRecord]:
+        def op():
+            rows = self._conn.execute(
+                "SELECT * FROM schedules WHERE paused = 0 AND next_fire_at IS NOT NULL"
+                " AND next_fire_at <= ? ORDER BY next_fire_at, schedule_id",
+                (now,),
+            ).fetchall()
+            return [_schedule_from_row(r) for r in rows]
+
+        return await self._run(op)
+
+    async def update_schedule(
+        self, schedule_id, *, expected_next_fire_at=_UNSET, paused=_UNSET, next_fire_at=_UNSET, last_run_id=_UNSET
+    ) -> bool:
+        sql, params = _schedule_update(
+            "?", schedule_id,
+            expected_next_fire_at=expected_next_fire_at, paused=paused,
+            next_fire_at=next_fire_at, last_run_id=last_run_id,
+        )
+
+        def op():
+            cursor = self._conn.execute(sql, params)
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+        return await self._run(op)
+
+    async def delete_schedule(self, schedule_id: str) -> None:
+        def op():
+            self._conn.execute("DELETE FROM schedules WHERE schedule_id = ?", (schedule_id,))
+            self._conn.commit()
+
+        await self._run(op)

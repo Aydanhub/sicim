@@ -80,7 +80,7 @@ Tüm gerçek iş (I/O, LLM çağrısı, API isteği) adımlarda yaşar. Bir adı
 
 - Adım *argümanları* journal'lanmaz (replay'de kod yeniden sağlar), bu yüzden adımlara canlı nesneler (LLM istemcisi, bağlantı) geçebilirsiniz.
 - Sync fonksiyonlar otomatik olarak worker thread'de çalışır.
-- `retry=RetryPolicy(...)` üstel backoff'la dener; başarısız denemeler journal'landığı için deneme sayacı çökmelerden etkilenmez. `sicim.NonRetryable` fırlatan (veya `non_retryable` listesindeki) hatalar anında `StepFailed` olur.
+- `retry=RetryPolicy(...)` üstel backoff'la dener; başarısız denemeler *ve bir sonraki denemenin zamanı* journal'landığı için ne deneme sayacı ne de backoff çökmelerden etkilenir: backoff'un ortasında çöken run, devam ettiğinde yalnızca kalan süreyi bekler (süre zaten geçmişse hemen dener). `sicim.NonRetryable` fırlatan (veya `non_retryable` listesindeki) hatalar anında `StepFailed` olur.
 - `timeout=` tek denemeyi sınırlar.
 
 ### Saga telafileri
@@ -133,6 +133,19 @@ async def research_agent(ctx, question):
 
 `ctx.child(wf, ...)` kayıtlı başka bir workflow'u **kendi journal'ına sahip bağımsız bir run** olarak başlatır ve sonucunu bekler — agent/sub-agent hiyerarşileri için. Çocuğun run id'si deterministiktir (`<parent>.c<op>`), bu yüzden çökme sonrası replay çocuğu yeniden başlatmaz, mevcut run'a yeniden bağlanır; ebeveyn ve çocuk bağımsız devam eder. Çocuğun terminal hatası ebeveynde `sicim.ChildFailed` fırlatır (yakalanabilir); çocuğu beklerken ebeveyn iptal edilirse çocuk da iptal edilir ve kendi telafilerini koşar. `compensate=` adımlardaki gibi çalışır.
 
+### Etiketler ve arama
+
+```python
+await rt.start(order_flow, "order-42", run_id="order-42", tags={"customer": "42", "env": "prod"})
+
+runs = await rt.list_runs(tags={"customer": "42"})                        # verilen tüm çiftler eşleşmeli
+runs = await rt.list_runs(sicim.RunStatus.RUNNING, workflow="order_flow")
+runs = await rt.list_runs(parent_run_id="arge-1")                          # bir run'ın çocukları
+runs = await rt.list_runs(limit=20, newest_first=True)
+```
+
+Etiketler, run başlarken sabitlenen düz `str -> str` çiftleridir: run kaydında ve `RUN_STARTED` olayında taşınır, workflow gövdesinde `ctx.tags` ile okunabilir (salt okunur; başlangıçta sabitlendiği için deterministiktir). Çocuk workflow'lar ebeveynin etiketlerini devralır (`ctx.child(..., tags=...)` ile geçersiz kılınır), continue-as-new ardılları da taşır — böylece bir müşteriye ait tüm agent ağacı tek sorguyla bulunur. SQL backend'lerinde etiketler ayrı, indeksli bir tabloda tutulur. `sicim.` önekli anahtarlar runtime'a ayrılmıştır (`sicim.schedule`, aşağıda).
+
 ### Çoklu worker ve lease
 
 Her `Runtime` bir *worker*'dır: bir run'ı sürmeden önce onun kirasını (lease) alır ve `lease_ttl / 3` aralıklı heartbeat ile yeniler. Aynı store'u birden çok worker güvenle paylaşır:
@@ -141,6 +154,8 @@ Her `Runtime` bir *worker*'dır: bir run'ı sürmeden önce onun kirasını (lea
 - Bir worker ölürse kiraları TTL sonunda düşer ve run'ları başka worker tarafından devralınır; `shutdown()` kiraları hemen bırakır (hızlı devir).
 - Başka worker'ın sürdüğü run'a `signal()` gönderilebilir: sinyal store'a kuyruklanır, bekleyen run `signal_poll_interval` (varsayılan 1 sn) içinde alır. `cancel()` de aynı şekilde çalışır: bayrak store'a yazılır, süren worker heartbeat'inde görüp kooperatif iptali başlatır.
 - Store bir **push kanalı** sunuyorsa (PostgreSQL LISTEN/NOTIFY), süren worker ilk run'ında otomatik abone olur: başka worker'ın gönderdiği sinyal ve iptal, poll'ü veya heartbeat'i beklemeden anında ulaşır. Poll/heartbeat güvenlik ağı olarak kalır — dinleyici bağlantısı kopsa bile doğruluk bozulmaz, sadece gecikme poll aralığına döner.
+- Çökme sonrası bir çocuk run'ı veya continue-as-new ardılını *başka* worker devralmışsa, ebeveyn (`ctx.child`) ve `handle.result()` o run'ı store üzerinden izleyip sonucunu alır; `LeaseUnavailable` ile düşmez.
+- Zamanlamalar da worker'lar arasında paylaşılır; her tick'i yalnız bir worker tetikler (bkz. *Zamanlanmış başlatma*).
 
 ```python
 rt = sicim.Runtime(store, worker_id="api-1", lease_ttl=30.0, signal_poll_interval=1.0)
@@ -178,6 +193,25 @@ async def agent_loop(ctx, state):
 
 **Otomatik zincir budama** — `Runtime(store, chain_keep=1)`: her continue'da canlı run'ın gerisindeki en yeni `chain_keep` halka journal'ını korur, daha eski halkaların journal'ı ve sinyal kutusu silinir. Run kayıtlarının kendisi (birkaç yüz bayt) yönlendirme için yerinde kalır: eski id'lerle `signal()`/`cancel()`/`result()` çalışmaya devam eder. Sonsuz döngülü bir agent'ın depolamasını sınırlayan budur; `chain_keep=None` (varsayılan) hiçbir şeye dokunmaz. Kayıtları tamamen silmek için `prune` CLI komutu duruyor.
 
+### Zamanlanmış başlatma
+
+```python
+await rt.schedule(inbox_agent, "destek@ornek.dev", schedule_id="inbox", every=300)          # 5 dakikada bir
+await rt.schedule(nightly_report, schedule_id="rapor", cron="0 2 * * *", tz="Europe/Istanbul")
+await rt.schedule(cleanup, schedule_id="tek-sefer", at=time.time() + 3600)                   # bir kez
+
+await rt.pause_schedule("inbox"); await rt.resume_schedule("inbox"); await rt.unschedule("inbox")
+runs = await rt.list_runs(tags={"sicim.schedule": "inbox"})   # bu zamanlamanın başlattığı run'lar
+```
+
+Bir zamanlama, workflow'un belirli anlarda **yeni bir run'ını başlatma** talimatıdır ve store'da yaşar. Üç tür vardır: `every=` (saniye veya `timedelta`; önceki tetiklemeye hizalı, kaymaz), `cron=` (klasik beş alan — `*`, liste, aralık, adım, ay/gün adları ve `@daily` gibi kısayollar; `tz` verilmezse UTC) ve `at=` (tek seferlik; zaman damgası veya `datetime`).
+
+- Her tick, `<schedule_id>@<zaman>` biçiminde **deterministik id'li** bir run başlatır; run'a `sicim.schedule=<id>` etiketi (artı `tags=` ile verdikleriniz) yazılır ve argümanlar her run'a aynen geçer.
+- **Çoklu worker'da tam-bir-kez:** her worker (varsayılan `scheduler=True`) bir şey sürmeye başladığında `schedule_poll_interval` (varsayılan 1 sn) aralıklarla vadesi gelen zamanlamalara bakar. Aynı tick'i gören worker'lar aynı run id'sini türetir — ikinci `create` birincil anahtara takılır ve kaybeden mevcut run'a bağlanır — ve zamanlama, tetikleme zamanı üzerinde compare-and-set ile ilerletilir. Garantiyi koordinasyon değil veritabanı verir. Yalnız sinyal gönderen istemciler `scheduler=False` geçebilir.
+- `overlap="skip"` (varsayılan): önceki run hâlâ çalışıyorsa tick atlanır (loglanır); `"allow"` her tick'te başlatır.
+- **Kaçırılan tick'ler birleşir:** hiçbir worker ayakta değilken geçen tetiklemeler için tek bir telafi run'ı başlatılır, sonraki tetikleme *şimdiden* hesaplanır. `pause` sırasında kaçanlar `resume` ile atlanır.
+- `schedule()` `schedule_id` üzerinde idempotenttir (mevcut zamanlama olduğu gibi döner); değiştirmek için `unschedule` + `schedule`. Workflow kodu yüklü olmayan bir worker tick'i ilerletmeden bırakır; kodu olan bir worker tetikler.
+
 ### PostgreSQL store
 
 ```bash
@@ -205,7 +239,7 @@ rt = sicim.Runtime(store, on_event=lambda run_id, event: metrics.emit(run_id, ev
 
 Her journal append'inde çağrılır; hook'un fırlattığı hatalar loglanır ve run'ı asla etkilemez.
 
-**OpenTelemetry** (`pip install 'sicim[otel]'`): hazır bir observer, journal olaylarını span'lere çevirir — run başına bir üst span, tamamlanan her adım/timer/bekleme/çocuk/telafi için journal zaman damgalarını taşıyan bir alt span; hatalar ERROR statüsüyle işaretlenir. Replay span üretmez (replay journal'a yazmaz).
+**OpenTelemetry** (`pip install 'sicim[otel]'`): hazır bir observer, journal olaylarını span'lere çevirir — run başına bir üst span, tamamlanan her adım/timer/bekleme/çocuk/telafi için journal zaman damgalarını taşıyan bir alt span; hatalar ERROR statüsüyle işaretlenir. Run etiketleri run span'ine `sicim.tag.<anahtar>` attribute'ları olarak yazılır. Replay span üretmez (replay journal'a yazmaz).
 
 Çocuk workflow'un run span'i, ebeveynin run span'inin **altına bağlanır** — agent/sub-agent ağacının tamamı tek trace olarak görünür — ve `sicim.parent_run_id` attribute'unu taşır (ebeveyn-çocuk bağı `RunRecord.parent_run_id` olarak store'a da yazılır; CLI `show` gösterir). Çökme sonrası çocuğu *başka bir süreç* devralırsa yeni span orijinal trace'e katılamaz; attribute üzerinden korelasyon orada da kalır.
 
@@ -236,42 +270,51 @@ Workflow **gövdesi** için (adımlar için değil):
 | Öğe | Ne yapar |
 |---|---|
 | `@sicim.workflow` / `@sicim.workflow(name=..., version=N)` | `async def` fonksiyonu workflow olarak kaydeder; versiyon run'a sabitlenir |
-| `Runtime(store, default_retry=, worker_id=, lease_ttl=, signal_poll_interval=, chain_keep=, on_event=)` | Worker; `InMemoryStore()` varsayılan |
-| `rt.start(wf, *args, run_id=...)` | Run başlatır (`run_id` üzerinde idempotent) → `RunHandle` |
+| `Runtime(store, default_retry=, worker_id=, lease_ttl=, signal_poll_interval=, chain_keep=, scheduler=, schedule_poll_interval=, on_event=)` | Worker; `InMemoryStore()` varsayılan |
+| `rt.start(wf, *args, run_id=..., tags=...)` | Run başlatır (`run_id` üzerinde idempotent) → `RunHandle` |
 | `rt.recover()` / `rt.resume(run_id)` | Yarım run'ları replay edip devam ettirir (kiralılar: atla / `LeaseUnavailable`) |
 | `rt.signal(run_id, name, payload)` | Olay teslim eder (gerekirse run'ı uyandırır; worker'lar arası çalışır) |
 | `rt.cancel(run_id)` | Kooperatif iptal + telafiler (worker'lar arası çalışır) |
 | `rt.status(run_id)` / `rt.events(run_id)` | Run kaydı / journal |
+| `rt.list_runs(status, workflow=, tags=, parent_run_id=, limit=, newest_first=)` | Run arama (tüm süzgeçler AND) |
+| `rt.schedule(wf, *args, schedule_id=, every= \| cron= \| at=, tz=, tags=, overlap=)` | Zamanlama oluşturur → `ScheduleRecord` |
+| `rt.get_schedule / list_schedules / pause_schedule / resume_schedule / unschedule` | Zamanlama yönetimi |
 | `rt.shutdown()` | Çökme-eşdeğeri durdurma (kiraları bırakır) |
 | `await handle` / `handle.result()` | Sonuç, ya da `WorkflowFailed` / `WorkflowCancelled` / `CompensationFailed` / `NonDeterminismError` |
-| `ctx.step / child / sleep / wait_event / now / random / uuid4 / gather / add_compensation / continue_as_new / log / is_replaying / version` | Workflow içi API |
+| `ctx.step / child / sleep / wait_event / now / random / uuid4 / gather / add_compensation / continue_as_new / log / is_replaying / version / tags` | Workflow içi API |
 
 Run durumları: `RUNNING → COMPLETED | FAILED | CANCELLED | COMPENSATION_FAILED | CONTINUED`.
 
 ## CLI
 
 ```bash
-python -m sicim --db sicim.db list
-python -m sicim --db sicim.db show <run_id>            # run kaydı + journal + sinyaller
+python -m sicim --db sicim.db list --status running --workflow order_flow --tag customer=42
+python -m sicim --db sicim.db list --limit 20                  # en yeni 20 run
+python -m sicim --db sicim.db show <run_id>                    # run kaydı + etiketler + journal + sinyaller
 python -m sicim --db sicim.db prune --older-than-days 30 --dry-run
+python -m sicim --db sicim.db schedule list
+python -m sicim --db sicim.db schedule pause|resume|delete <schedule_id>
 ```
 
-`prune`, verilen eşikten eski terminal run'ları (journal'larıyla birlikte) siler; `RUNNING` ve insan müdahalesi bekleyen `COMPENSATION_FAILED` run'lara asla dokunmaz. Tüm komutlar `--db` yerine `--pg DSN` ile PostgreSQL'e karşı da çalışır.
+`list`, `--status`, `--workflow` ve tekrarlanabilir `--tag k=v` süzgeçlerinin hepsini birlikte uygular; `--limit N` en yeni N run'ı gösterir. `prune`, verilen eşikten eski terminal run'ları (journal'larıyla birlikte) siler; `RUNNING` ve insan müdahalesi bekleyen `COMPENSATION_FAILED` run'lara asla dokunmaz. Tüm komutlar `--db` yerine `--pg DSN` ile PostgreSQL'e karşı da çalışır.
 
 ## Örnekler ve test
 
 ```bash
-.venv/bin/python examples/order_saga.py      # saga + telafi + çökmeden devam
-.venv/bin/python examples/agent_research.py  # LLM agent: paralel araçlar, insan onayı, çökme
-.venv/bin/pytest -q                          # tüm senaryolar iki backend'de de koşar
+.venv/bin/python examples/order_saga.py       # saga + telafi + çökmeden devam
+.venv/bin/python examples/agent_research.py   # LLM agent: paralel araçlar, insan onayı, çökme
+.venv/bin/python examples/scheduled_agent.py  # aralıkla tetiklenen agent, çakışan tick'ler atlanır
+.venv/bin/pytest -q                           # tüm senaryolar üç backend'de de koşar
 ```
 
-## v0.4 kısıtları ve yol haritası
+## v0.5 kısıtları ve yol haritası
 
 - Sinyal, var olmayan run'a gönderilemez (önce `start`).
-- Retry backoff *bekleyişi* journal'lanmaz (deneme sayısı journal'lanır); çökme sonrası sıradaki deneme hemen yapılır.
 - Lease devralma TTL çözünürlüğündedir: ölen worker'ın run'ı en fazla `lease_ttl` sonra devralınır.
 - Ebeveyn *başarısız olduğunda* (iptal değil), o an `gather` içinde koşan çocuklar bağımsız devam eder — gerekirse telafide `cancel` edin.
 - Push kanalı yalnız PostgreSQL'de; SQLite/bellek store'larında worker'lar arası sinyal/iptal poll ve heartbeat ile taşınır (tek süreç içinde zaten anındadır).
 - Çökme sonrası çocuğu başka süreç devralırsa span'i orijinal trace'e katılamaz; `sicim.parent_run_id` ile korelasyon kalır.
-- Yol haritası: journal'lanan retry backoff (çökme sonrası kalan bekleme korunur), run arama/etiketleme (workflow'a ve etikete göre listeleme), zamanlanmış/cron başlatma, web tabanlı izleme arayüzü.
+- Etiketler run başladıktan sonra değiştirilemez (workflow gövdesi `ctx.tags`'i deterministik okur).
+- Zamanlama çözünürlüğü `schedule_poll_interval`'dır; cron dakika hassasiyetindedir ve DST geçişlerinde var olmayan/yinelenen duvar saatleri bir sonraki geçerli dakikaya kayar. Adlandırılmış saat dilimleri (`tz=`) sistem tz veritabanını (yoksa `tzdata` paketini) ister; UTC için gerekmez.
+- `overlap="skip"` çoklu worker'da en-iyi-çabadır: "önceki run bitti mi" kontrolü ile başlatma arasındaki dar yarışta nadiren bir fazla run başlayabilir. Aynı tick'in iki kez başlaması ise deterministik id sayesinde imkânsızdır.
+- Yol haritası: web tabanlı izleme arayüzü (etiket/workflow süzgeçli run listesi, journal ve zamanlama görünümü), run'a sonradan etiket ekleme, cron için saniye alanı ve `@every` kısayolları.

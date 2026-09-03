@@ -1,5 +1,7 @@
 """Continue-as-new: bounded journals for infinitely-looping workflows."""
 
+import asyncio
+
 import pytest
 from helpers import Gate, counting_step, wait_for_events
 
@@ -144,3 +146,30 @@ async def test_continued_runs_are_prunable_history(rt):
     assert (await rt.status("pchain#3")).result == "end"
     assert await rt.store.load_run("pchain") is None
     assert await rt.store.load_events("pchain") == []
+
+
+async def test_result_follows_a_chain_driven_by_another_worker(store):
+    @workflow(name="wf_can_remote")
+    async def wf(ctx, hop):
+        if hop:
+            await ctx.continue_as_new(False)
+        return await ctx.wait_event("go")
+
+    rt_a = Runtime(store, worker_id="A")
+    await rt_a.start(wf, True, run_id="CR")
+    await wait_for_events(store, "CR#2", Kind.WAIT_CREATED, 1)
+    await rt_a.shutdown()
+
+    rt_c = Runtime(store, worker_id="C", signal_poll_interval=0.05)
+    [live] = await rt_c.recover()
+    assert live.run_id == "CR#2"
+    rt_b = Runtime(store, worker_id="B", signal_poll_interval=0.05)
+    handle = await rt_b.resume("CR")  # a CONTINUED record: no lease needed for the handle itself
+    waiter = asyncio.ensure_future(handle.result())
+    await asyncio.sleep(0.15)
+    assert not waiter.done()  # following C's run through the store, not failing on its lease
+
+    await rt_c.signal("CR#2", "go", "done")
+    assert await asyncio.wait_for(waiter, timeout=3) == "done"
+    await rt_b.shutdown()
+    await rt_c.shutdown()

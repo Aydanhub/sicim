@@ -96,3 +96,19 @@ async def test_failed_run_span_has_error_status(store):
     spans = {span.name: span for span in exporter.get_finished_spans()}
     assert spans["sicim.step boom"].status.status_code is StatusCode.ERROR
     assert spans["sicim.run wf_otel_fail"].status.status_code is StatusCode.ERROR
+
+
+async def test_run_span_carries_tags(store):
+    tracer, exporter = make_tracer()
+    rt = Runtime(store, on_event=otel_observer(tracer))
+
+    @workflow(name="wf_otel_tags")
+    async def wf(ctx):
+        return "t"
+
+    handle = await rt.start(wf, run_id="ott", tags={"customer": "42"})
+    assert await handle.result() == "t"
+    await rt.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert spans["sicim.run wf_otel_tags"].attributes["sicim.tag.customer"] == "42"

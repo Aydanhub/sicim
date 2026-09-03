@@ -1,9 +1,11 @@
 """Tiny inspection & maintenance CLI for sicim databases.
 
 Usage:
-    python -m sicim --db sicim.db list [--status running]
+    python -m sicim --db sicim.db list [--status running] [--workflow NAME] [--tag k=v ...] [--limit N]
     python -m sicim --db sicim.db show RUN_ID
     python -m sicim --db sicim.db prune --older-than-days 30 [--dry-run]
+    python -m sicim --db sicim.db schedule list
+    python -m sicim --db sicim.db schedule pause|resume|delete SCHEDULE_ID
 
 Every command also works against PostgreSQL via ``--pg DSN`` instead of ``--db``.
 """
@@ -16,6 +18,7 @@ import datetime as dt
 import sys
 import time
 
+from .runtime import Runtime
 from .store import RunStatus, SQLiteStore, Store
 
 #: Statuses prune may delete. RUNNING is live and COMPENSATION_FAILED needs a
@@ -23,20 +26,39 @@ from .store import RunStatus, SQLiteStore, Store
 _PRUNABLE = (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.CONTINUED)
 
 
-def _fmt_ts(ts: float) -> str:
+def _fmt_ts(ts: float | None) -> str:
+    if ts is None:
+        return "-"
     return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
-async def _list(store: Store, status: str | None) -> None:
-    runs = await store.list_runs(RunStatus(status) if status else None)
+def _fmt_tags(tags: dict[str, str]) -> str:
+    return ",".join(f"{key}={value}" for key, value in sorted(tags.items()))
+
+
+def _parse_tag(text: str) -> tuple[str, str]:
+    key, sep, value = text.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(f"tag must look like key=value, got {text!r}")
+    return key, value
+
+
+async def _list(store: Store, args: argparse.Namespace) -> None:
+    runs = await store.list_runs(
+        RunStatus(args.status) if args.status else None,
+        workflow=args.workflow,
+        tags=dict(args.tag) if args.tag else None,
+        limit=args.limit,
+        newest_first=args.limit is not None,
+    )
     if not runs:
         print("(no runs)")
         return
-    print(f"{'RUN ID':<36} {'WORKFLOW':<24} {'STATUS':<20} {'CREATED':<19} UPDATED")
+    print(f"{'RUN ID':<36} {'WORKFLOW':<24} {'STATUS':<20} {'CREATED':<19} {'UPDATED':<19} TAGS")
     for run in runs:
         print(
             f"{run.run_id:<36} {run.workflow:<24} {run.status.value:<20} "
-            f"{_fmt_ts(run.created_at):<19} {_fmt_ts(run.updated_at)}"
+            f"{_fmt_ts(run.created_at):<19} {_fmt_ts(run.updated_at):<19} {_fmt_tags(run.tags)}"
         )
 
 
@@ -52,6 +74,8 @@ async def _show(store: Store, run_id: str) -> None:
         print(f"parent:   {record.parent_run_id}")
     if record.continued_to:
         print(f"continued_to: {record.continued_to}")
+    if record.tags:
+        print(f"tags:     {_fmt_tags(record.tags)}")
     print(f"args:     {record.args!r}")
     if record.kwargs:
         print(f"kwargs:   {record.kwargs!r}")
@@ -94,6 +118,31 @@ async def _prune(store: Store, older_than_days: float, dry_run: bool) -> None:
     )
 
 
+async def _schedule(store: Store, args: argparse.Namespace) -> None:
+    rt = Runtime(store, scheduler=False)  # pure store operations; fires nothing
+    if args.action == "list":
+        schedules = await rt.list_schedules()
+        if not schedules:
+            print("(no schedules)")
+            return
+        print(f"{'SCHEDULE ID':<24} {'WORKFLOW':<24} {'SPEC':<28} {'STATE':<7} {'NEXT FIRE':<19} LAST RUN")
+        for sched in schedules:
+            state = "paused" if sched.paused else ("done" if sched.next_fire_at is None else "active")
+            spec = sched.spec + (f" ({sched.tz})" if sched.tz else "")
+            print(
+                f"{sched.schedule_id:<24} {sched.workflow:<24} {spec:<28} {state:<7} "
+                f"{_fmt_ts(sched.next_fire_at):<19} {sched.last_run_id or '-'}"
+            )
+        return
+    if args.action == "pause":
+        await rt.pause_schedule(args.schedule_id)
+    elif args.action == "resume":
+        await rt.resume_schedule(args.schedule_id)
+    else:
+        await rt.unschedule(args.schedule_id)
+    print(f"schedule '{args.schedule_id}' {args.action}d")
+
+
 async def _amain(args: argparse.Namespace) -> None:
     if args.pg:
         from .pg import PostgresStore
@@ -103,9 +152,11 @@ async def _amain(args: argparse.Namespace) -> None:
         store = SQLiteStore(args.db)
     try:
         if args.command == "list":
-            await _list(store, args.status)
+            await _list(store, args)
         elif args.command == "show":
             await _show(store, args.run_id)
+        elif args.command == "schedule":
+            await _schedule(store, args)
         else:
             await _prune(store, args.older_than_days, args.dry_run)
     finally:
@@ -119,8 +170,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--db", help="path to a sicim SQLite database")
     parser.add_argument("--pg", metavar="DSN", help="PostgreSQL DSN (alternative to --db)")
     sub = parser.add_subparsers(dest="command", required=True)
-    p_list = sub.add_parser("list", help="list runs")
+    p_list = sub.add_parser("list", help="list runs (chronological; with --limit, the newest N)")
     p_list.add_argument("--status", choices=[s.value for s in RunStatus], default=None)
+    p_list.add_argument("--workflow", default=None, help="only runs of this workflow")
+    p_list.add_argument(
+        "--tag", action="append", type=_parse_tag, metavar="KEY=VALUE",
+        help="only runs carrying this tag (repeatable; all must match)",
+    )
+    p_list.add_argument("--limit", type=int, default=None, help="show only the newest N runs")
     p_show = sub.add_parser("show", help="show a run's record, journal and signals")
     p_show.add_argument("run_id")
     p_prune = sub.add_parser(
@@ -128,6 +185,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_prune.add_argument("--older-than-days", type=float, default=30.0)
     p_prune.add_argument("--dry-run", action="store_true")
+    p_sched = sub.add_parser("schedule", help="list, pause, resume or delete schedules")
+    sched_sub = p_sched.add_subparsers(dest="action", required=True)
+    sched_sub.add_parser("list", help="list schedules")
+    for action in ("pause", "resume", "delete"):
+        p_action = sched_sub.add_parser(action, help=f"{action} a schedule")
+        p_action.add_argument("schedule_id")
     args = parser.parse_args(argv)
 
     if bool(args.db) == bool(args.pg):

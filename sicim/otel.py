@@ -12,6 +12,7 @@ Spans are derived from journal appends, so timings are the journal's own:
 * one child span per finished operation — step, timer, wait, child workflow,
   compensation — from its defining event to its completion, with attempt
   counts and error details as attributes;
+* run tags become ``sicim.tag.<key>`` attributes on the run span;
 * a child workflow's run span is parented under the parent's run span (one
   trace across the whole agent tree) and carries ``sicim.parent_run_id``. A
   child resumed later by a *different* process cannot rejoin the original
@@ -96,6 +97,8 @@ def otel_observer(tracer: Any = None) -> Callable[[str, Event], None]:
             span.set_attribute("sicim.workflow", payload.get("workflow", ""))
             if payload.get("parent"):
                 span.set_attribute("sicim.parent_run_id", payload["parent"])
+            for key, value in (payload.get("tags") or {}).items():
+                span.set_attribute(f"sicim.tag.{key}", value)
             run_spans[run_id] = span
         elif kind in _STARTING_KINDS:
             op_starts[(run_id, event.op_id)] = event

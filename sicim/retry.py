@@ -14,8 +14,9 @@ class RetryPolicy:
 
     Attempt counts survive crashes: failed attempts are journaled, so a step
     that already burned 2 of its 5 attempts before a crash resumes at attempt 3.
-    Backoff *waits* are not journaled — after a crash the next attempt starts
-    immediately on resume.
+    Backoff waits survive too: each failed attempt journals the time of the
+    next try (jitter included), so a crash mid-backoff resumes with only the
+    remaining wait — and none at all if that time has already passed.
     """
 
     max_attempts: int = 3

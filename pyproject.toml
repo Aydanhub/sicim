@@ -1,6 +1,6 @@
 [project]
 name = "sicim"
-version = "0.4.0"
+version = "0.5.0"
 description = "Durable agent runtime: deterministic replay, checkpoint resume and saga-style compensation for long-running LLM agent workflows."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -22,21 +22,23 @@ import inspect
 import logging
 import random as _random
 import time
+import types
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
 from . import serde
 from .errors import (
     ChildFailed,
     CompensationFailed,
+    LeaseUnavailable,
     NonDeterminismError,
     StepFailed,
     WaitTimeout,
     WorkflowCancelled,
     WorkflowFailed,
 )
-from .journal import Journal, Kind
+from .journal import Event, Journal, Kind
 from .retry import RetryPolicy
 from .workflow import WorkflowFn, workflow_name
 
@@ -90,13 +92,21 @@ class WorkflowContext:
     """Handle passed as the first argument to every workflow function."""
 
     def __init__(
-        self, *, run_id: str, workflow_name: str, runtime: "Runtime", journal: Journal, version: int = 1
+        self,
+        *,
+        run_id: str,
+        workflow_name: str,
+        runtime: "Runtime",
+        journal: Journal,
+        version: int = 1,
+        tags: Mapping[str, str] | None = None,
     ):
         self.run_id = run_id
         self.workflow_name = workflow_name
         #: Workflow version pinned at run start. New code branches on it
         #: (``if ctx.version >= 2: ...``) to evolve without breaking old runs.
         self.version = version
+        self._tags: dict[str, str] = dict(tags or {})
         self._runtime = runtime
         self._journal = journal
         self._op_counter = 0
@@ -147,6 +157,31 @@ class WorkflowContext:
             await asyncio.gather(ev_task, sleep_task, return_exceptions=True)
         if cancel_ev.is_set():
             raise asyncio.CancelledError()
+
+    @property
+    def tags(self) -> Mapping[str, str]:
+        """The run's search tags, pinned at start (read-only). Child
+        workflows inherit them unless ``ctx.child(..., tags=...)`` overrides."""
+        return types.MappingProxyType(self._tags)
+
+    async def _finish_backoff(self, last_failure: Event | None, *, cancellable: bool = True) -> None:
+        """Wait out the remainder of a journaled retry backoff.
+
+        Each retried attempt journals ``retry_at``; a resume that lands in
+        the middle of that wait sleeps only until then (not at all if the
+        time already passed), instead of retrying immediately or restarting
+        the full backoff.
+        """
+        retry_at = last_failure.payload.get("retry_at") if last_failure is not None else None
+        if retry_at is None:
+            return
+        remaining = retry_at - time.time()
+        if remaining <= 0:
+            return
+        if cancellable:
+            await self._wait_or_cancel(remaining)
+        else:
+            await asyncio.sleep(remaining)
 
     def _expect(self, kind: str, op_id: int, name: str | None = None):
         """Return the defining event at op_id, verifying it matches the request."""
@@ -258,9 +293,11 @@ class WorkflowContext:
             error = failed.payload["error"]
             raise StepFailed(name, op_id, failed.payload["attempts"], error["type"], error["message"])
 
-        # Live execution with durable attempt counting.
+        # Live execution with durable attempt counting; a backoff that was
+        # in progress when the process died is finished, not restarted.
         policy = retry or self._runtime.default_retry
         attempt = journal.count(Kind.STEP_ATTEMPT_FAILED, op_id)
+        await self._finish_backoff(journal.last(Kind.STEP_ATTEMPT_FAILED, op_id))
         while True:
             attempt += 1
             self._check_cancel()
@@ -271,12 +308,18 @@ class WorkflowContext:
                 raise
             except BaseException as exc:  # noqa: BLE001 - classified by the retry policy
                 if policy.should_retry(exc, attempt):
+                    retry_at = time.time() + policy.delay(attempt)
                     await journal.append(
                         Kind.STEP_ATTEMPT_FAILED,
                         op_id,
-                        {"name": name, "attempt": attempt, "error": serde.error_info(exc)},
+                        {
+                            "name": name,
+                            "attempt": attempt,
+                            "error": serde.error_info(exc),
+                            "retry_at": retry_at,
+                        },
                     )
-                    await self._wait_or_cancel(policy.delay(attempt))
+                    await self._wait_or_cancel(retry_at - time.time())
                     continue
                 info = serde.error_info(exc)
                 await journal.append(
@@ -345,6 +388,9 @@ class WorkflowContext:
                 continue
             policy = entry.retry or self._runtime.default_retry
             attempt = journal.count(Kind.COMP_ATTEMPT_FAILED, entry.op_id)
+            await self._finish_backoff(
+                journal.last(Kind.COMP_ATTEMPT_FAILED, entry.op_id), cancellable=False
+            )
             while True:
                 attempt += 1
                 try:
@@ -353,12 +399,18 @@ class WorkflowContext:
                     raise  # process shutdown: resume finishes compensations later
                 except BaseException as exc:  # noqa: BLE001
                     if policy.should_retry(exc, attempt):
+                        retry_at = time.time() + policy.delay(attempt)
                         await journal.append(
                             Kind.COMP_ATTEMPT_FAILED,
                             entry.op_id,
-                            {"name": entry.name, "attempt": attempt, "error": serde.error_info(exc)},
+                            {
+                                "name": entry.name,
+                                "attempt": attempt,
+                                "error": serde.error_info(exc),
+                                "retry_at": retry_at,
+                            },
                         )
-                        await asyncio.sleep(policy.delay(attempt))
+                        await asyncio.sleep(max(retry_at - time.time(), 0.0))
                         continue
                     info = {"name": entry.name, "attempts": attempt, "error": serde.error_info(exc)}
                     await journal.append(Kind.COMP_FAILED, entry.op_id, info)
@@ -378,6 +430,7 @@ class WorkflowContext:
         /,
         *args: Any,
         run_id: str | None = None,
+        tags: Mapping[str, str] | None = None,
         compensate: Callable[..., Any] | None = None,
         compensate_args: tuple[Any, ...] = (),
         compensate_kwargs: dict[str, Any] | None = None,
@@ -391,7 +444,9 @@ class WorkflowContext:
         child's run id is deterministic (``<parent>.c<op>`` unless ``run_id`` is
         given), which makes starting it idempotent across replays. A terminal
         child error raises :class:`ChildFailed` in the parent; cancelling the
-        parent while it awaits a child cancels the child too.
+        parent while it awaits a child cancels the child too. The child
+        inherits the parent's ``tags`` unless given its own, so a search by
+        tag finds the whole agent tree.
         """
         op_id = self._next_op()
         return self._child(
@@ -400,6 +455,7 @@ class WorkflowContext:
             args,
             kwargs,
             run_id=run_id,
+            tags=tags,
             compensate=compensate,
             compensate_args=compensate_args,
             compensate_kwargs=compensate_kwargs or {},
@@ -414,6 +470,7 @@ class WorkflowContext:
         kwargs: dict[str, Any],
         *,
         run_id: str | None,
+        tags: Mapping[str, str] | None,
         compensate: Callable[..., Any] | None,
         compensate_args: tuple[Any, ...],
         compensate_kwargs: dict[str, Any],
@@ -455,11 +512,22 @@ class WorkflowContext:
             raise ChildFailed(child_name, child_run_id, error["type"], error["message"])
 
         # Live: start (or re-attach to) the child run and await it, staying
-        # responsive to cooperative cancellation of the parent.
-        handle = await self._runtime._start(
-            wf, args, kwargs, run_id=child_run_id, parent_run_id=self.run_id
-        )
-        result_task = asyncio.ensure_future(handle.result())
+        # responsive to cooperative cancellation of the parent. If another
+        # worker holds the child's lease (it recovered the child before us),
+        # its outcome is followed through the store instead of failing here.
+        try:
+            handle = await self._runtime._start(
+                wf,
+                args,
+                kwargs,
+                run_id=child_run_id,
+                parent_run_id=self.run_id,
+                tags=self._tags if tags is None else tags,
+            )
+            outcome = handle.result()
+        except LeaseUnavailable:
+            outcome = self._runtime._await_remote(child_run_id)
+        result_task = asyncio.ensure_future(outcome)
         cancel_task = asyncio.ensure_future(self._runtime._cancel_event(self.run_id).wait())
         try:
             await asyncio.wait({result_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)

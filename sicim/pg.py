@@ -28,7 +28,19 @@ from typing import Any, Awaitable, Callable
 
 from . import serde
 from .journal import Event
-from .store import RunRecord, RunStatus, SignalRecord, Store, _UNSET
+from .store import (
+    _SCHEDULE_COLUMNS,
+    _UNSET,
+    RunRecord,
+    RunStatus,
+    ScheduleRecord,
+    SignalRecord,
+    Store,
+    _run_query,
+    _schedule_from_row,
+    _schedule_params,
+    _schedule_update,
+)
 
 logger = logging.getLogger("sicim")
 
@@ -48,8 +60,15 @@ CREATE TABLE IF NOT EXISTS runs (
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     continued_to TEXT,
     parent_run_id TEXT,
+    tags TEXT NOT NULL DEFAULT '{}',
     created_at DOUBLE PRECISION NOT NULL,
     updated_at DOUBLE PRECISION NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_tags (
+    run_id TEXT NOT NULL,
+    tag_key TEXT NOT NULL,
+    tag_value TEXT NOT NULL,
+    PRIMARY KEY (run_id, tag_key)
 );
 CREATE TABLE IF NOT EXISTS events (
     run_id TEXT NOT NULL,
@@ -74,11 +93,32 @@ CREATE TABLE IF NOT EXISTS leases (
     owner TEXT NOT NULL,
     expires_at DOUBLE PRECISION NOT NULL
 );
+CREATE TABLE IF NOT EXISTS schedules (
+    schedule_id TEXT PRIMARY KEY,
+    workflow TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    args TEXT NOT NULL,
+    kwargs TEXT NOT NULL,
+    tz TEXT,
+    tags TEXT NOT NULL DEFAULT '{}',
+    overlap TEXT NOT NULL DEFAULT 'skip',
+    paused INTEGER NOT NULL DEFAULT 0,
+    next_fire_at DOUBLE PRECISION,
+    last_run_id TEXT,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_workflow ON runs(workflow);
+CREATE INDEX IF NOT EXISTS idx_run_tags_kv ON run_tags(tag_key, tag_value);
+CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(next_fire_at);
 """
 
 #: Statements bringing databases created by older sicim versions up to date.
-_MIGRATIONS = ("ALTER TABLE runs ADD COLUMN IF NOT EXISTS parent_run_id TEXT",)
+_MIGRATIONS = (
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS parent_run_id TEXT",
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS tags TEXT NOT NULL DEFAULT '{}'",
+)
 
 
 class PostgresStore(Store):
@@ -226,17 +266,26 @@ class PostgresStore(Store):
             int(record.cancel_requested),
             record.continued_to,
             record.parent_run_id,
+            serde.encode(record.tags),
             record.created_at,
             record.updated_at,
         )
+        tag_rows = [(record.run_id, key, value) for key, value in record.tags.items()]
 
         async def op(conn):
-            await conn.execute(
-                "INSERT INTO runs (run_id, workflow, version, args, kwargs, status, result, error,"
-                " cancel_requested, continued_to, parent_run_id, created_at, updated_at)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                params,
-            )
+            # Record and tag index land together or not at all.
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO runs (run_id, workflow, version, args, kwargs, status, result, error,"
+                    " cancel_requested, continued_to, parent_run_id, tags, created_at, updated_at)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    params,
+                )
+                if tag_rows:
+                    async with conn.cursor() as cursor:
+                        await cursor.executemany(
+                            "INSERT INTO run_tags (run_id, tag_key, tag_value) VALUES (%s,%s,%s)", tag_rows
+                        )
 
         await self._with_conn(op)
 
@@ -254,6 +303,7 @@ class PostgresStore(Store):
             cancel_requested=bool(row["cancel_requested"]),
             continued_to=row["continued_to"],
             parent_run_id=row["parent_run_id"],
+            tags=serde.decode(row["tags"]) if row["tags"] else {},
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -295,14 +345,13 @@ class PostgresStore(Store):
 
         await self._with_conn(op)
 
-    async def list_runs(self, status: RunStatus | None = None) -> list[RunRecord]:
+    async def list_runs(
+        self, status=None, *, workflow=None, tags=None, parent_run_id=None, limit=None, newest_first=False
+    ) -> list[RunRecord]:
+        sql, params = _run_query("%s", status, workflow, tags, parent_run_id, limit, newest_first)
+
         async def op(conn):
-            if status is None:
-                cursor = await conn.execute("SELECT * FROM runs ORDER BY created_at")
-            else:
-                cursor = await conn.execute(
-                    "SELECT * FROM runs WHERE status = %s ORDER BY created_at", (status.value,)
-                )
+            cursor = await conn.execute(sql, params)
             return await cursor.fetchall()
 
         rows = await self._with_conn(op)
@@ -310,7 +359,7 @@ class PostgresStore(Store):
 
     async def delete_run(self, run_id: str) -> None:
         async def op(conn):
-            for table in ("events", "signals", "leases", "runs"):
+            for table in ("events", "signals", "run_tags", "leases", "runs"):
                 await conn.execute(f"DELETE FROM {table} WHERE run_id = %s", (run_id,))
 
         await self._with_conn(op)
@@ -445,3 +494,66 @@ class PostgresStore(Store):
 
         row = await self._with_conn(op)
         return (row["owner"], row["expires_at"]) if row else None
+
+    # -- schedules -----------------------------------------------------------
+
+    async def create_schedule(self, record: ScheduleRecord) -> None:
+        params = _schedule_params(record)
+
+        async def op(conn):
+            await conn.execute(
+                f"INSERT INTO schedules ({_SCHEDULE_COLUMNS})"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                params,
+            )
+
+        await self._with_conn(op)
+
+    async def load_schedule(self, schedule_id: str) -> ScheduleRecord | None:
+        async def op(conn):
+            cursor = await conn.execute(
+                "SELECT * FROM schedules WHERE schedule_id = %s", (schedule_id,)
+            )
+            return await cursor.fetchone()
+
+        row = await self._with_conn(op)
+        return _schedule_from_row(row) if row else None
+
+    async def list_schedules(self) -> list[ScheduleRecord]:
+        async def op(conn):
+            cursor = await conn.execute("SELECT * FROM schedules ORDER BY created_at, schedule_id")
+            return await cursor.fetchall()
+
+        return [_schedule_from_row(row) for row in await self._with_conn(op)]
+
+    async def list_due_schedules(self, now: float) -> list[ScheduleRecord]:
+        async def op(conn):
+            cursor = await conn.execute(
+                "SELECT * FROM schedules WHERE paused = 0 AND next_fire_at IS NOT NULL"
+                " AND next_fire_at <= %s ORDER BY next_fire_at, schedule_id",
+                (now,),
+            )
+            return await cursor.fetchall()
+
+        return [_schedule_from_row(row) for row in await self._with_conn(op)]
+
+    async def update_schedule(
+        self, schedule_id, *, expected_next_fire_at=_UNSET, paused=_UNSET, next_fire_at=_UNSET, last_run_id=_UNSET
+    ) -> bool:
+        sql, params = _schedule_update(
+            "%s", schedule_id,
+            expected_next_fire_at=expected_next_fire_at, paused=paused,
+            next_fire_at=next_fire_at, last_run_id=last_run_id,
+        )
+
+        async def op(conn):
+            cursor = await conn.execute(sql, params)
+            return cursor.rowcount > 0
+
+        return await self._with_conn(op)
+
+    async def delete_schedule(self, schedule_id: str) -> None:
+        async def op(conn):
+            await conn.execute("DELETE FROM schedules WHERE schedule_id = %s", (schedule_id,))
+
+        await self._with_conn(op)

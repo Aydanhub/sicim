@@ -159,3 +159,36 @@ async def test_cancelling_parent_cancels_awaited_child(store):
     assert (await rt.status("P5")).status is RunStatus.CANCELLED
     assert sorted(order) == ["child_comp", "parent_comp"]
     await rt.shutdown()
+
+
+async def test_child_driven_by_another_worker_is_awaited_not_failed(store):
+    @workflow(name="child_remote")
+    async def child(ctx):
+        return await ctx.wait_event("go")
+
+    @workflow(name="parent_remote")
+    async def parent(ctx):
+        return await ctx.child(child)
+
+    # Worker A starts the tree and crashes while the child waits for a signal.
+    rt_a = Runtime(store, worker_id="A")
+    await rt_a.start(parent, run_id="PR")
+    await wait_for_events(store, "PR.c0", Kind.WAIT_CREATED, 1)
+    await rt_a.shutdown()
+
+    # Worker C grabs the child first; worker B recovers only the parent.
+    rt_c = Runtime(store, worker_id="C", signal_poll_interval=0.05)
+    child_handle = await rt_c.resume("PR.c0")
+    rt_b = Runtime(store, worker_id="B", signal_poll_interval=0.05)
+    [parent_handle] = await rt_b.recover()
+    assert parent_handle.run_id == "PR"
+
+    await asyncio.sleep(0.15)
+    assert (await rt_b.status("PR")).status is RunStatus.RUNNING  # waiting on C's run, not failed
+
+    await rt_c.signal("PR.c0", "go", {"ok": 1})
+    assert await child_handle.result() == {"ok": 1}
+    assert await asyncio.wait_for(parent_handle.result(), timeout=3) == {"ok": 1}
+    assert (await rt_b.status("PR")).status is RunStatus.COMPLETED
+    await rt_b.shutdown()
+    await rt_c.shutdown()

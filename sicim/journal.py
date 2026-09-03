@@ -109,6 +109,7 @@ class Journal:
         self._on_append = on_append
         self._events: list[Event] = list(events)
         self._first: dict[tuple[str, int], Event] = {}
+        self._last: dict[tuple[str, int], Event] = {}
         self._counts: dict[tuple[str, int], int] = {}
         self._defining: dict[int, Event] = {}
         self.consumed_signal_seqs: set[int] = set()
@@ -120,6 +121,7 @@ class Journal:
     def _absorb(self, event: Event) -> None:
         key = (event.kind, event.op_id)
         self._first.setdefault(key, event)
+        self._last[key] = event
         self._counts[key] = self._counts.get(key, 0) + 1
         if event.kind in DEFINING_KINDS:
             self._defining.setdefault(event.op_id, event)
@@ -139,6 +141,10 @@ class Journal:
     def find(self, kind: str, op_id: int) -> Event | None:
         """First event of ``kind`` at ``op_id``, if recorded."""
         return self._first.get((kind, op_id))
+
+    def last(self, kind: str, op_id: int) -> Event | None:
+        """Most recent event of ``kind`` at ``op_id``, if recorded."""
+        return self._last.get((kind, op_id))
 
     def count(self, kind: str, op_id: int) -> int:
         return self._counts.get((kind, op_id), 0)

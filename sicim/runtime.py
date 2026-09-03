@@ -17,10 +17,10 @@ import asyncio
 import contextlib
 import logging
 import re
+import datetime as dt
+import time
 import uuid
-from typing import Any
-
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from . import serde
 from .context import WorkflowContext, _ContinueAsNew
@@ -29,13 +29,24 @@ from .errors import (
     LeaseUnavailable,
     NonDeterminismError,
     RunNotFound,
+    ScheduleNotFound,
     SicimError,
     WorkflowCancelled,
     WorkflowFailed,
+    WorkflowNotFound,
 )
 from .journal import Event, Journal, Kind
 from .retry import RetryPolicy
-from .store import InMemoryStore, RunRecord, RunStatus, SignalRecord, Store
+from .schedule import build_spec, parse_spec, scheduled_run_id
+from .store import (
+    InMemoryStore,
+    RunRecord,
+    RunStatus,
+    ScheduleRecord,
+    SignalRecord,
+    Store,
+    validate_tags,
+)
 from .workflow import WorkflowFn, get_workflow, workflow_name, workflow_version
 
 logger = logging.getLogger("sicim")
@@ -92,7 +103,11 @@ class RunHandle:
                         f"run '{current.run_id}' continued as '{outcome.next_run_id}' "
                         "but this handle has no runtime to follow the chain with"
                     )
-                current = await current._runtime.resume(outcome.next_run_id)
+                try:
+                    current = await current._runtime.resume(outcome.next_run_id)
+                except LeaseUnavailable:
+                    # The successor is driven by another worker: follow it via the store.
+                    return await current._runtime._await_remote(outcome.next_run_id)
                 continue
             return outcome
 
@@ -150,6 +165,13 @@ class Runtime:
     records, which stay behind so signal/cancel/result routing by old run ids
     keeps working. None (the default) prunes nothing.
 
+    ``scheduler`` (default True) lets this worker fire due schedules
+    (``Runtime.schedule``): once it drives anything, a background loop polls
+    the schedule table every ``schedule_poll_interval`` seconds. Several
+    workers may do this at once — deterministic run ids plus a
+    compare-and-set on the schedule make each tick start at most one run.
+    Signal-only clients can pass ``scheduler=False``.
+
     ``on_event`` is an observability hook called as ``on_event(run_id, event)``
     after every journal append; exceptions it raises are logged and ignored.
     """
@@ -163,16 +185,22 @@ class Runtime:
         lease_ttl: float = 30.0,
         signal_poll_interval: float = 1.0,
         chain_keep: int | None = None,
+        scheduler: bool = True,
+        schedule_poll_interval: float = 1.0,
         on_event: Callable[[str, Event], None] | None = None,
     ):
         if chain_keep is not None and chain_keep < 0:
             raise ValueError("chain_keep must be None or an int >= 0")
+        if schedule_poll_interval <= 0:
+            raise ValueError("schedule_poll_interval must be > 0")
         self.store = store or InMemoryStore()
         self.default_retry = default_retry or RetryPolicy()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.lease_ttl = lease_ttl
         self.signal_poll_interval = signal_poll_interval
         self.chain_keep = chain_keep
+        self.scheduler = scheduler
+        self.schedule_poll_interval = schedule_poll_interval
         self.on_event = on_event
         self._handles: dict[str, RunHandle] = {}
         self._waiters: dict[str, set[asyncio.Future]] = {}
@@ -181,15 +209,27 @@ class Runtime:
         self._spawn_lock = asyncio.Lock()
         self._subscription: Callable[[], Any] | None = None
         self._subscribe_attempted = False
+        self._scheduler_task: asyncio.Task | None = None
+        self._unregistered_warned: set[str] = set()
         self._closing = False
 
     # -- public API ----------------------------------------------------------
 
-    async def start(self, wf: WorkflowFn, /, *args: Any, run_id: str | None = None, **kwargs: Any) -> RunHandle:
+    async def start(
+        self,
+        wf: WorkflowFn,
+        /,
+        *args: Any,
+        run_id: str | None = None,
+        tags: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> RunHandle:
         """Start a run. Idempotent on ``run_id``: if the run already exists (for
         the same workflow), it is resumed with its *stored* inputs and the new
-        arguments are ignored."""
-        return await self._start(wf, args, kwargs, run_id=run_id, parent_run_id=None)
+        arguments are ignored. ``tags`` (``str -> str``) are pinned to the run
+        for :meth:`list_runs` searches; ``run_id`` and ``tags`` are reserved
+        keywords, every other keyword argument goes to the workflow."""
+        return await self._start(wf, args, kwargs, run_id=run_id, parent_run_id=None, tags=tags)
 
     async def _start(
         self,
@@ -199,8 +239,10 @@ class Runtime:
         *,
         run_id: str | None,
         parent_run_id: str | None,
+        tags: Mapping[str, str] | None = None,
     ) -> RunHandle:
         name = workflow_name(wf)
+        tags = validate_tags(tags)
         run_id = run_id or uuid.uuid4().hex
         existing = await self.store.load_run(run_id)
         if existing is not None:
@@ -217,8 +259,17 @@ class Runtime:
             args=serde.roundtrip(list(args)) or [],
             kwargs=serde.roundtrip(kwargs) or {},
             parent_run_id=parent_run_id,
+            tags=tags,
         )
-        await self.store.create_run(record)
+        try:
+            await self.store.create_run(record)
+        except Exception:
+            # Deterministic ids (child runs, schedule ticks) let two workers
+            # race to create the same run; the loser attaches to the winner's.
+            existing = await self.store.load_run(run_id)
+            if existing is None or existing.workflow != name:
+                raise
+            return await self._ensure(existing)
         logger.info("[%s] started workflow '%s'", run_id, name)
         return await self._ensure(record)
 
@@ -233,6 +284,7 @@ class Runtime:
         Runs leased by another live worker are skipped; they become claimable
         here once that worker releases them or its lease expires.
         """
+        self._ensure_scheduler()
         records = await self.store.list_runs(status=RunStatus.RUNNING)
         handles = []
         for record in records:
@@ -290,6 +342,120 @@ class Runtime:
     async def events(self, run_id: str) -> list[Event]:
         return await self.store.load_events(run_id)
 
+    async def list_runs(
+        self,
+        status: RunStatus | None = None,
+        *,
+        workflow: str | None = None,
+        tags: Mapping[str, str] | None = None,
+        parent_run_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[RunRecord]:
+        """Search runs. Every given filter must match; ``tags`` means all of
+        the given pairs. Oldest first unless ``newest_first``."""
+        return await self.store.list_runs(
+            status,
+            workflow=workflow,
+            tags=tags,
+            parent_run_id=parent_run_id,
+            limit=limit,
+            newest_first=newest_first,
+        )
+
+    # -- schedules -----------------------------------------------------------
+
+    async def schedule(
+        self,
+        wf: WorkflowFn,
+        /,
+        *args: Any,
+        schedule_id: str | None = None,
+        every: float | dt.timedelta | None = None,
+        cron: str | None = None,
+        at: float | dt.datetime | None = None,
+        tz: str | None = None,
+        tags: Mapping[str, str] | None = None,
+        overlap: str = "skip",
+        **kwargs: Any,
+    ) -> ScheduleRecord:
+        """Start runs of ``wf(*args, **kwargs)`` on a schedule.
+
+        Exactly one of ``every`` (seconds or ``timedelta``), ``cron`` (five
+        fields or ``@daily``-style alias; UTC unless ``tz`` names an IANA zone)
+        or ``at`` (UNIX timestamp or ``datetime``, one-shot) is required. Each
+        tick starts a run with the deterministic id ``<schedule_id>@<time>``,
+        tagged ``sicim.schedule=<schedule_id>`` plus ``tags``. With
+        ``overlap="skip"`` (default) a tick is skipped while the previous run
+        is still running; ``"allow"`` starts runs regardless. Ticks missed
+        while no worker was up collapse into a single catch-up run.
+
+        Idempotent on ``schedule_id``: an existing schedule is returned as is.
+        """
+        spec = build_spec(every=every, cron=cron, at=at, tz=tz)
+        if overlap not in ("skip", "allow"):
+            raise ValueError("overlap must be 'skip' or 'allow'")
+        name = workflow_name(wf)
+        schedule_id = schedule_id or uuid.uuid4().hex
+        existing = await self.store.load_schedule(schedule_id)
+        if existing is None:
+            record = ScheduleRecord(
+                schedule_id=schedule_id,
+                workflow=name,
+                spec=spec.text,
+                args=serde.roundtrip(list(args)) or [],
+                kwargs=serde.roundtrip(kwargs) or {},
+                tz=tz,
+                tags=validate_tags(tags),
+                overlap=overlap,
+                next_fire_at=spec.first_fire_at(time.time()),
+            )
+            try:
+                await self.store.create_schedule(record)
+            except Exception:
+                existing = await self.store.load_schedule(schedule_id)
+                if existing is None:
+                    raise
+            else:
+                logger.info("[schedule %s] created for '%s' (%s)", schedule_id, name, spec.text)
+                existing = record
+        if existing.workflow != name:
+            raise SicimError(
+                f"schedule '{schedule_id}' already exists for workflow '{existing.workflow}', "
+                f"cannot schedule it as '{name}'"
+            )
+        self._ensure_scheduler()
+        return existing
+
+    async def get_schedule(self, schedule_id: str) -> ScheduleRecord:
+        record = await self.store.load_schedule(schedule_id)
+        if record is None:
+            raise ScheduleNotFound(f"no schedule with id '{schedule_id}'")
+        return record
+
+    async def list_schedules(self) -> list[ScheduleRecord]:
+        return await self.store.list_schedules()
+
+    async def pause_schedule(self, schedule_id: str) -> None:
+        """Stop firing until :meth:`resume_schedule`; runs already started continue."""
+        await self.get_schedule(schedule_id)
+        await self.store.update_schedule(schedule_id, paused=True)
+
+    async def resume_schedule(self, schedule_id: str) -> None:
+        """Resume a paused schedule from *now*: ticks missed while paused are skipped."""
+        record = await self.get_schedule(schedule_id)
+        spec = parse_spec(record.spec, record.tz)
+        await self.store.update_schedule(
+            schedule_id, paused=False, next_fire_at=spec.next_after(time.time())
+        )
+        self._ensure_scheduler()
+
+    async def unschedule(self, schedule_id: str) -> None:
+        """Delete a schedule; runs it already started are unaffected."""
+        await self.get_schedule(schedule_id)
+        await self.store.delete_schedule(schedule_id)
+        logger.info("[schedule %s] deleted", schedule_id)
+
     async def shutdown(self) -> None:
         """Stop driving runs without touching their state (crash-equivalent).
 
@@ -298,6 +464,8 @@ class Runtime:
         """
         self._closing = True
         tasks = [h._task for h in self._handles.values() if h._task is not None and not h._task.done()]
+        if self._scheduler_task is not None and not self._scheduler_task.done():
+            tasks.append(self._scheduler_task)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -371,6 +539,17 @@ class Runtime:
         except Exception:
             logger.exception("chain pruning behind '%s' failed; continuing", tail_id)
 
+    async def _await_remote(self, run_id: str) -> Any:
+        """Outcome of a run driven by *another* worker: poll the store until the
+        run (or the live end of its chain) is terminal, then report exactly
+        what a local :class:`RunHandle` would."""
+        while True:
+            record = await self._follow_chain(await self._load(run_id))
+            if record.status.terminal:
+                return await RunHandle(record.run_id, record=record, runtime=self)._outcome()
+            run_id = record.run_id
+            await asyncio.sleep(self.signal_poll_interval)
+
     async def _ensure(self, record: RunRecord) -> RunHandle:
         """Get the live handle for a run, spawning its driver task if needed."""
         async with self._spawn_lock:
@@ -385,6 +564,7 @@ class Runtime:
                 lease = await self.store.load_lease(record.run_id)
                 raise LeaseUnavailable(record.run_id, lease[0] if lease else None)
             await self._ensure_subscribed()
+            self._ensure_scheduler()
             wf = get_workflow(record.workflow)
             events = await self.store.load_events(record.run_id)
             journal = Journal(record.run_id, self.store, events, on_append=self.on_event)
@@ -394,6 +574,7 @@ class Runtime:
                 runtime=self,
                 journal=journal,
                 version=record.version,
+                tags=record.tags,
             )
             self._cancel_flags[record.run_id] = record.cancel_requested
             if record.cancel_requested:
@@ -427,6 +608,8 @@ class Runtime:
             started = {"workflow": record.workflow, "args": serde.preview(record.args)}
             if record.parent_run_id:
                 started["parent"] = record.parent_run_id
+            if record.tags:
+                started["tags"] = record.tags
             await journal.append_once(Kind.RUN_STARTED, -1, started)
             try:
                 result = await wf(ctx, *record.args, **record.kwargs)
@@ -470,6 +653,7 @@ class Runtime:
                             args=cont.next_args,
                             kwargs=cont.next_kwargs,
                             parent_run_id=record.parent_run_id,
+                            tags=record.tags,
                         )
                     )
                 await self.store.update_run(run_id, status=RunStatus.CONTINUED, continued_to=next_id)
@@ -566,6 +750,82 @@ class Runtime:
             self._cancel_flags[run_id] = True
             self._cancel_event(run_id).set()
         self._wake(run_id)
+
+    # -- scheduler -----------------------------------------------------------
+
+    def _ensure_scheduler(self) -> None:
+        """Start this worker's schedule-firing loop (once; opt-out via ``scheduler=False``)."""
+        if not self.scheduler or self._closing or self._scheduler_task is not None:
+            return
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="sicim-scheduler")
+        self._scheduler_task.add_done_callback(self._retrieve_exception)
+
+    async def _scheduler_loop(self) -> None:
+        while True:
+            try:
+                await self._fire_due_schedules()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("scheduler tick failed; retrying in %.1fs", self.schedule_poll_interval)
+            await asyncio.sleep(self.schedule_poll_interval)
+
+    async def _fire_due_schedules(self) -> None:
+        now = time.time()
+        for record in await self.store.list_due_schedules(now):
+            await self._fire_schedule(record, now)
+
+    async def _fire_schedule(self, sched: ScheduleRecord, now: float) -> None:
+        """Start the run for one due tick and advance the schedule.
+
+        Safe with any number of workers: the tick's run id is deterministic
+        (the store's primary key rejects a second create, and the loser just
+        attaches), and the schedule is advanced with a compare-and-set on the
+        fire time, so exactly one worker records the tick. Missed ticks are
+        collapsed: the next fire time is computed from ``max(fire_at, now)``.
+        """
+        fire_at = sched.next_fire_at
+        assert fire_at is not None
+        spec = parse_spec(sched.spec, sched.tz)
+        next_fire_at = spec.next_after(max(fire_at, now))
+        run_id = scheduled_run_id(sched.schedule_id, fire_at)
+        if sched.overlap == "skip" and sched.last_run_id and await self._run_is_live(sched.last_run_id):
+            if await self.store.update_schedule(
+                sched.schedule_id, expected_next_fire_at=fire_at, next_fire_at=next_fire_at
+            ):
+                logger.info(
+                    "[schedule %s] skipped tick %s: previous run '%s' still running",
+                    sched.schedule_id, run_id, sched.last_run_id,
+                )
+            return
+        try:
+            wf = get_workflow(sched.workflow)
+        except WorkflowNotFound:
+            # Leave the tick due: a worker that has the code will fire it.
+            if sched.schedule_id not in self._unregistered_warned:
+                self._unregistered_warned.add(sched.schedule_id)
+                logger.warning(
+                    "[schedule %s] workflow '%s' is not registered in this worker; not firing",
+                    sched.schedule_id, sched.workflow,
+                )
+            return
+        tags = {**sched.tags, "sicim.schedule": sched.schedule_id}
+        try:
+            await self._start(
+                wf, tuple(sched.args), dict(sched.kwargs), run_id=run_id, parent_run_id=None, tags=tags
+            )
+        except LeaseUnavailable:
+            pass  # another worker fired this tick first and is driving the run
+        if await self.store.update_schedule(
+            sched.schedule_id, expected_next_fire_at=fire_at, next_fire_at=next_fire_at, last_run_id=run_id
+        ):
+            logger.info("[schedule %s] started run '%s'", sched.schedule_id, run_id)
+
+    async def _run_is_live(self, run_id: str) -> bool:
+        record = await self.store.load_run(run_id)
+        if record is None:
+            return False
+        return not (await self._follow_chain(record)).status.terminal
 
     # -- hooks used by WorkflowContext ---------------------------------------
 
