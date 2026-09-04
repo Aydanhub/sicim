@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sicim</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f4f6f8; --panel: #ffffff; --line: #dde3ea; --text: #182230; --muted: #66748a;
+  --accent: #2563eb; --accent-bg: #e8effd;
+  --ok: #15803d; --ok-bg: #e3f6ea; --err: #b91c1c; --err-bg: #fbe7e7; --warn: #b45309; --warn-bg: #fdf1dc;
+  --info: #0e7490; --info-bg: #e0f4f8; --gray: #4b5563; --gray-bg: #eceff3; --purple: #7e22ce; --purple-bg: #f1e6fb;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1419; --panel: #171d25; --line: #2a3441; --text: #e5eaf1; --muted: #8b98ab;
+    --accent: #6ea0ff; --accent-bg: #1a2a4a; --ok: #4ade80; --ok-bg: #123322; --err: #f87171; --err-bg: #3b1616;
+    --warn: #fbbf24; --warn-bg: #3a2a0d; --info: #67e8f9; --info-bg: #0e2f36; --gray: #b3bcc9; --gray-bg: #242c37;
+    --purple: #d8b4fe; --purple-bg: #2f1d45;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--muted); }
+.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bad { color: var(--err); }
+header { display: flex; align-items: center; gap: 18px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
+header .brand { font-weight: 700; font-size: 16px; color: var(--text); letter-spacing: .3px; }
+header nav a { margin-right: 14px; color: var(--muted); font-weight: 600; }
+header nav a.active { color: var(--text); }
+header form { margin-left: auto; display: flex; gap: 6px; }
+header label { display: flex; align-items: center; gap: 5px; color: var(--muted); white-space: nowrap; }
+#meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+main { padding: 18px 20px 40px; max-width: 1440px; margin: 0 auto; }
+input, select, textarea, button { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+textarea { font-family: var(--mono); font-size: 12px; width: 100%; min-height: 64px; resize: vertical; }
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.danger { color: var(--err); }
+button.danger:hover { border-color: var(--err); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; user-select: none; }
+.chip.active { border-color: var(--accent); background: var(--accent-bg); }
+.chip b { font-variant-numeric: tabular-nums; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+.filters input[type=text] { min-width: 200px; }
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); background: var(--bg); font-weight: 600; white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px; white-space: nowrap; }
+.s-running, .s-active { color: var(--accent); background: var(--accent-bg); }
+.s-completed, .s-done { color: var(--ok); background: var(--ok-bg); }
+.s-failed { color: var(--err); background: var(--err-bg); }
+.s-cancelled, .s-paused { color: var(--warn); background: var(--warn-bg); }
+.s-compensation_failed { color: var(--purple); background: var(--purple-bg); }
+.s-continued { color: var(--info); background: var(--info-bg); }
+.tag { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; margin: 1px 3px 1px 0; border-radius: 4px; background: var(--gray-bg); color: var(--gray); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.tag[data-tagfilter] { cursor: pointer; }
+.tag.reserved { opacity: .7; }
+.tag.removed { text-decoration: line-through; }
+.tag .x { color: var(--muted); font-weight: 700; margin-left: 2px; cursor: pointer; }
+.tag .x:hover { color: var(--err); }
+.crumbs { margin-bottom: 8px; color: var(--muted); }
+.head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.head h1 { margin: 0; font-size: 18px; font-weight: 600; word-break: break-all; font-family: var(--mono); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+.card.wide { grid-column: 1 / -1; }
+.card h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); font-weight: 600; }
+.card .tablewrap { border-radius: 6px; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; word-break: break-all; }
+pre { margin: 0; padding: 10px; background: var(--bg); border-radius: 6px; font-family: var(--mono); font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; max-height: 360px; }
+.k-run { font-weight: 600; }
+.k-step { color: var(--accent); }
+.k-comp { color: var(--purple); }
+.k-child { color: var(--info); }
+.k-timer, .k-wait, .k-event { color: var(--warn); }
+.k-value { color: var(--muted); }
+.k-tags { color: var(--gray); }
+tr.row { cursor: pointer; }
+tr.row:hover td { background: var(--bg); }
+tr.detail td { background: var(--bg); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+form.inline { display: flex; gap: 6px; flex-wrap: wrap; align-items: flex-start; }
+form.inline textarea { flex: 1 1 100%; }
+.empty { padding: 30px; text-align: center; color: var(--muted); background: var(--panel); border: 1px dashed var(--line); border-radius: 8px; }
+#toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 80vw; }
+#toast.show { opacity: 1; }
+#toast.error { background: var(--err); color: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="#/runs">sicim</a>
+  <nav><a href="#/runs" data-nav="runs">Runs</a><a href="#/schedules" data-nav="schedules">Schedules</a></nav>
+  <form id="jump"><input type="text" name="id" placeholder="open run id…" size="28"><button>Open</button></form>
+  <label><input type="checkbox" id="auto" checked> auto-refresh</label>
+  <button id="refresh" title="refresh now">&#x27F3;</button>
+  <span id="meta"></span>
+</header>
+<main id="app"><div class="empty">Loading…</div></main>
+<div id="toast"></div>
+<script>
+(() => {
+'use strict';
+const app = document.getElementById('app');
+const meta = document.getElementById('meta');
+const auto = document.getElementById('auto');
+const toastEl = document.getElementById('toast');
+const STATUSES = ['running', 'completed', 'failed', 'cancelled', 'compensation_failed', 'continued'];
+const state = { view: null, key: null, expanded: new Set(), busy: false };
+
+// -- helpers -----------------------------------------------------------------
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const enc = encodeURIComponent;
+const pad = (n) => String(n).padStart(2, '0');
+const runLink = (id) => `<a class="mono" href="#/runs/${enc(id)}">${esc(id)}</a>`;
+
+function ts(t) {
+  if (t == null) return '–';
+  const d = new Date(t * 1000);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function dur(s) {
+  if (s == null) return '–';
+  s = Math.abs(s);
+  if (s < 1) return `${Math.round(s * 1000)}ms`;
+  if (s < 60) return `${s < 10 ? s.toFixed(1) : Math.round(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+}
+function rel(t, now) {
+  if (t == null) return '–';
+  const delta = t - now;
+  return delta < 0 ? `${dur(delta)} ago` : `in ${dur(delta)}`;
+}
+const when = (t, now) => `<span class="num" title="${esc(ts(t))}">${esc(rel(t, now))}</span>`;
+function shortJson(v, max = 90) {
+  let s;
+  try { s = JSON.stringify(v); } catch (e) { s = String(v); }
+  if (s === undefined) s = 'null';
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+const pretty = (v) => `<pre>${esc(JSON.stringify(v === undefined ? null : v, null, 2))}</pre>`;
+const badge = (status) => `<span class="badge s-${esc(status)}">${esc(String(status).replace('_', ' '))}</span>`;
+const errText = (e) => (e ? `<span class="bad">${esc(e.type)}: ${esc(e.message)}</span>` : '');
+
+function tagChips(tags, opts = {}) {
+  const entries = Object.entries(tags || {});
+  if (!entries.length) return '<span class="muted">–</span>';
+  return entries.map(([k, v]) => {
+    const reserved = k.startsWith('sicim.');
+    const removed = v === null;
+    const cls = `tag${reserved ? ' reserved' : ''}${removed ? ' removed' : ''}`;
+    const x = opts.removable && !reserved && !removed ? `<span class="x" data-untag="${esc(k)}" title="remove tag">×</span>` : '';
+    const attr = opts.filter ? ` data-tagfilter="${esc(k)}=${esc(v ?? '')}" title="filter by this tag"` : '';
+    return `<span class="${cls}"${attr}>${esc(k)}${removed ? '' : '=' + esc(v)}${x}</span>`;
+  }).join('');
+}
+
+async function api(path, init = {}) {
+  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...init });
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* no body */ }
+  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+  return data;
+}
+
+let toastTimer;
+function toast(msg, isError = false) {
+  toastEl.textContent = msg;
+  toastEl.className = `show${isError ? ' error' : ''}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toastEl.className = ''; }, isError ? 6000 : 2500);
+}
+async function act(label, fn) {
+  try {
+    await fn();
+    if (label) toast(label);
+    await render(true);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+function setMeta(summary) {
+  meta.textContent = `v${summary.version} · ${summary.store} · ${summary.worker_id}`;
+}
+
+// -- routing -----------------------------------------------------------------
+function parseHash() {
+  const raw = location.hash.replace(/^#\/?/, '');
+  const qi = raw.indexOf('?');
+  const path = qi < 0 ? raw : raw.slice(0, qi);
+  const params = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
+  const segs = path.split('/');
+  if (segs[0] === 'runs' && segs.length > 1 && segs[1]) {
+    let id = segs[1];
+    try { id = decodeURIComponent(id); } catch (e) { /* keep raw */ }
+    return { view: 'run', id, params };
+  }
+  if (segs[0] === 'schedules') return { view: 'schedules', params };
+  return { view: 'runs', params };
+}
+const runsHash = (params) => { const q = params.toString(); return `#/runs${q ? '?' + q : ''}`; };
+function go(hash) {
+  if (location.hash === hash) render(true); else location.hash = hash;
+}
+
+// Keep what the user typed into forms across auto-refreshes.
+function snapshotForms() {
+  const saved = {};
+  app.querySelectorAll('form[id]').forEach((form) => {
+    saved[form.id] = {};
+    form.querySelectorAll('input[name], textarea[name], select[name]').forEach((el) => { saved[form.id][el.name] = el.value; });
+  });
+  return saved;
+}
+function restoreForms(saved) {
+  for (const [id, values] of Object.entries(saved)) {
+    const form = document.getElementById(id);
+    if (!form) continue;
+    for (const [name, value] of Object.entries(values)) {
+      const el = form.elements[name];
+      if (el && !(el instanceof RadioNodeList)) el.value = value;
+    }
+  }
+}
+
+async function render(force = false) {
+  const r = parseHash();
+  const key = JSON.stringify([r.view, r.id || '', r.params.toString()]);
+  const changed = key !== state.key;
+  if (changed) { state.expanded.clear(); state.key = key; }
+  state.view = r.view;
+  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === (r.view === 'run' ? 'runs' : r.view)));
+  if (state.busy) return;
+  state.busy = true;
+  const saved = changed ? {} : snapshotForms();
+  try {
+    if (r.view === 'run') await renderRun(r.id);
+    else if (r.view === 'schedules') await renderSchedules();
+    else await renderRuns(r.params);
+    restoreForms(saved);
+  } catch (e) {
+    app.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  } finally {
+    state.busy = false;
+  }
+}
+
+// -- views -------------------------------------------------------------------
+async function renderRuns(params) {
+  const query = new URLSearchParams();
+  for (const k of ['status', 'workflow', 'parent', 'limit', 'order']) if (params.get(k)) query.set(k, params.get(k));
+  for (const t of params.getAll('tag')) query.append('tag', t);
+  const [summary, data] = await Promise.all([api('/api/summary'), api('/api/runs?' + query.toString())]);
+  setMeta(summary);
+  const now = data.now;
+  const status = params.get('status') || '';
+  const total = Object.values(summary.counts).reduce((a, b) => a + b, 0);
+  const chips = [`<span class="chip${status ? '' : ' active'}" data-status="">all <b>${total}</b></span>`]
+    .concat(STATUSES.map((s) => `<span class="chip${status === s ? ' active' : ''}" data-status="${s}">${badge(s)} <b>${summary.counts[s] || 0}</b></span>`))
+    .join('');
+  const wfOptions = ['<option value="">any workflow</option>']
+    .concat(summary.workflows.map((w) => `<option value="${esc(w)}"${params.get('workflow') === w ? ' selected' : ''}>${esc(w)}</option>`))
+    .join('');
+  const limit = params.get('limit') || '100';
+  const limitOptions = ['25', '50', '100', '500', '0'].map((n) => `<option value="${n}"${limit === n ? ' selected' : ''}>${n === '0' ? 'no limit' : 'limit ' + n}</option>`).join('');
+  const rows = data.runs.map((r) => `<tr>
+      <td>${runLink(r.run_id)}</td>
+      <td>${esc(r.workflow)} <span class="muted">v${r.version}</span></td>
+      <td>${badge(r.status)}${r.cancel_requested && r.status === 'running' ? ' <span class="muted">cancelling…</span>' : ''}</td>
+      <td>${tagChips(r.tags, { filter: true })}</td>
+      <td>${when(r.created_at, now)}</td>
+      <td>${when(r.updated_at, now)}</td>
+      <td>${r.parent_run_id ? runLink(r.parent_run_id) : ''}${r.continued_to ? ' → ' + runLink(r.continued_to) : ''}</td>
+    </tr>`).join('');
+  app.innerHTML = `
+    <div class="chips">${chips}</div>
+    <form class="filters" id="filters">
+      <select name="workflow">${wfOptions}</select>
+      <input type="text" name="tags" placeholder="tags: customer=42 env=prod" value="${esc(params.getAll('tag').join(' '))}">
+      <input type="text" name="parent" placeholder="parent run id" value="${esc(params.get('parent') || '')}">
+      <select name="limit">${limitOptions}</select>
+      <select name="order"><option value="newest">newest first</option><option value="oldest"${params.get('order') === 'oldest' ? ' selected' : ''}>oldest first</option></select>
+      <button>Apply</button> <a href="#/runs">clear</a>
+      <span class="muted">${data.runs.length} shown</span>
+    </form>
+    ${data.runs.length
+      ? `<div class="tablewrap"><table><thead><tr><th>Run</th><th>Workflow</th><th>Status</th><th>Tags</th><th>Created</th><th>Updated</th><th>Parent / next</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      : '<div class="empty">No runs match.</div>'}`;
+}
+
+function summarize(e, now) {
+  const p = e.payload || {};
+  const name = p.name ? `<b>${esc(p.name)}</b>` : '';
+  switch (e.kind) {
+    case 'run_started': return `${esc(p.workflow || '')}${p.parent ? ' · parent ' + runLink(p.parent) : ''} · args ${esc(p.args || '[]')}`;
+    case 'run_completed': return `result ${esc(shortJson(p.result))}`;
+    case 'run_failed': return `${errText(p.error)}${p.compensation_failures ? ` · ${p.compensation_failures.length} compensation(s) failed` : (p.compensated ? ' · compensated' : '')}`;
+    case 'run_cancelled': return p.compensation_failures ? `${p.compensation_failures.length} compensation(s) failed` : 'compensations applied';
+    case 'run_continued': return `→ ${runLink(p.next_run_id)} · args ${esc(p.args || '[]')}`;
+    case 'step_scheduled': return `${name} ${esc(p.args || '')}${p.compensation ? ` · compensate <b>${esc(p.compensation)}</b>` : ''}`;
+    case 'step_attempt_failed': return `${name} attempt ${p.attempt}: ${errText(p.error)} · retry ${esc(rel(p.retry_at, now))}`;
+    case 'step_completed': return `${name}${p.attempts > 1 ? ` (${p.attempts} attempts)` : ''} → ${esc(shortJson(p.result))}`;
+    case 'step_failed': return `${name} after ${p.attempts} attempt(s): ${errText(p.error)}`;
+    case 'comp_registered': return name;
+    case 'comp_attempt_failed': return `${name} attempt ${p.attempt}: ${errText(p.error)} · retry ${esc(rel(p.retry_at, now))}`;
+    case 'comp_completed': return `${name}${p.attempts > 1 ? ` (${p.attempts} attempts)` : ''} done`;
+    case 'comp_failed': return `${name} after ${p.attempts} attempt(s): ${errText(p.error)}`;
+    case 'child_scheduled': return `${name} → ${runLink(p.child_run_id)} · args ${esc(p.args || '')}`;
+    case 'child_completed': return `${name} ${runLink(p.child_run_id)} → ${esc(shortJson(p.result))}`;
+    case 'child_failed': return `${name} ${runLink(p.child_run_id)}: ${errText(p.error)}`;
+    case 'timer_created': return `sleep ${esc(dur(p.seconds))} · fires ${esc(ts(p.fire_at))}`;
+    case 'timer_fired': return 'fired';
+    case 'wait_created': return `${name}${p.deadline ? ' · deadline ' + esc(ts(p.deadline)) : ''}`;
+    case 'event_consumed': return `${name} · signal #${p.signal_seq} → ${esc(shortJson(p.payload))}`;
+    case 'wait_timed_out': return `${name} timed out`;
+    case 'value_recorded': return `${name} = ${esc(shortJson(p.value))}`;
+    case 'tags_updated': return tagChips(p.tags);
+    default: return esc(shortJson(p));
+  }
+}
+
+async function renderRun(id) {
+  const data = await api(`/api/runs/${enc(id)}`);
+  const { run, events, signals, lease, children, now } = data;
+  api('/api/summary').then(setMeta).catch(() => {});
+  const first = events.length ? events[0].ts : run.created_at;
+  const m = /^(.*)#(\d+)$/.exec(run.run_id);
+  const prev = m ? (Number(m[2]) > 2 ? `${m[1]}#${Number(m[2]) - 1}` : m[1]) : null;
+  const running = run.status === 'running';
+  const journalRows = events.map((e) => {
+    const failed = /failed|timed_out/.test(e.kind);
+    const cls = 'k-' + e.kind.split('_')[0];
+    const open = state.expanded.has(e.seq);
+    return `<tr class="row" data-seq="${e.seq}">
+        <td class="num muted">${e.seq}</td>
+        <td class="num" title="${esc(ts(e.ts))}">+${(e.ts - first).toFixed(3)}s</td>
+        <td class="${cls}${failed ? ' bad' : ''}">${esc(e.kind)}</td>
+        <td class="num muted">${e.op_id >= 0 ? e.op_id : ''}</td>
+        <td>${summarize(e, now)}</td>
+      </tr>${open ? `<tr class="detail"><td colspan="5">${pretty(e.payload)}</td></tr>` : ''}`;
+  }).join('');
+  const signalRows = signals.map((s) => `<tr>
+      <td class="num muted">${s.seq}</td><td><b>${esc(s.name)}</b></td>
+      <td>${s.consumed ? '<span class="muted">consumed</span>' : '<span class="s-running badge">pending</span>'}</td>
+      <td>${when(s.ts, now)}</td><td class="mono">${esc(shortJson(s.payload, 200))}</td>
+    </tr>`).join('');
+  const childRows = children.map((c) => `<tr>
+      <td>${runLink(c.run_id)}</td><td>${esc(c.workflow)}</td><td>${badge(c.status)}</td>
+      <td>${tagChips(c.tags)}</td><td>${when(c.updated_at, now)}</td>
+    </tr>`).join('');
+  const outcome = run.status === 'completed'
+    ? `<h2>Result</h2>${pretty(run.result)}`
+    : run.error
+      ? `<h2>Error</h2><p>${errText(run.error)}</p>${pretty(run.error)}`
+      : `<h2>Outcome</h2><p class="muted">${running ? 'still running' : run.status === 'continued' ? 'continued as ' + runLink(run.continued_to) : '–'}</p>`;
+  app.innerHTML = `
+    <div class="crumbs"><a href="#/runs">Runs</a> › <a href="#/runs?workflow=${enc(run.workflow)}">${esc(run.workflow)}</a></div>
+    <div class="head">
+      <h1>${esc(run.run_id)}</h1>
+      ${badge(run.status)}
+      ${run.cancel_requested && running ? '<span class="muted">cancel requested…</span>' : ''}
+      ${running && !run.cancel_requested ? `<button class="danger" data-cancel="${esc(run.run_id)}">Cancel run</button>` : ''}
+    </div>
+    <div class="grid">
+      <section class="card"><h2>Record</h2><dl>
+        <dt>workflow</dt><dd>${esc(run.workflow)} <span class="muted">v${run.version}</span></dd>
+        <dt>created</dt><dd>${esc(ts(run.created_at))} <span class="muted">(${esc(rel(run.created_at, now))})</span></dd>
+        <dt>updated</dt><dd>${esc(ts(run.updated_at))} <span class="muted">(${esc(rel(run.updated_at, now))})</span></dd>
+        ${run.parent_run_id ? `<dt>parent</dt><dd>${runLink(run.parent_run_id)}</dd>` : ''}
+        ${prev ? `<dt>previous</dt><dd>${runLink(prev)}</dd>` : ''}
+        ${run.continued_to ? `<dt>continued to</dt><dd>${runLink(run.continued_to)}</dd>` : ''}
+        <dt>lease</dt><dd>${lease ? `${esc(lease.owner)} <span class="muted">(expires ${esc(rel(lease.expires_at, now))})</span>` : '<span class="muted">none</span>'}</dd>
+        <dt>journal</dt><dd>${events.length} events · ${signals.length} signals · ${children.length} children</dd>
+      </dl></section>
+      <section class="card"><h2>Tags</h2>
+        <p>${tagChips(run.tags, { removable: true })}</p>
+        <form class="inline" id="addtag"><input type="text" name="key" placeholder="key" required size="12"><input type="text" name="value" placeholder="value" size="16"><button>Add tag</button></form>
+      </section>
+      <section class="card"><h2>Signal</h2>
+        ${running
+          ? `<form class="inline" id="signal"><input type="text" name="name" placeholder="event name (e.g. approval)" required><button class="primary">Send</button><textarea name="payload" placeholder="payload as JSON — empty sends null"></textarea></form>`
+          : '<p class="muted">Signals can only be sent to running runs.</p>'}
+      </section>
+      <section class="card"><h2>Inputs</h2>${pretty(run.kwargs && Object.keys(run.kwargs).length ? { args: run.args, kwargs: run.kwargs } : run.args)}</section>
+      <section class="card">${outcome}</section>
+      ${children.length ? `<section class="card wide"><h2>Children (${children.length})</h2><div class="tablewrap"><table><thead><tr><th>Run</th><th>Workflow</th><th>Status</th><th>Tags</th><th>Updated</th></tr></thead><tbody>${childRows}</tbody></table></div></section>` : ''}
+      <section class="card wide"><h2>Journal (${events.length} events) <span class="muted" style="text-transform:none;font-weight:400">— click a row for the full payload</span></h2>
+        ${events.length ? `<div class="tablewrap"><table><thead><tr><th>#</th><th>Time</th><th>Kind</th><th>Op</th><th>Detail</th></tr></thead><tbody>${journalRows}</tbody></table></div>` : '<p class="muted">No events yet (or the history was pruned).</p>'}
+      </section>
+      ${signals.length ? `<section class="card wide"><h2>Signals (${signals.length})</h2><div class="tablewrap"><table><thead><tr><th>#</th><th>Name</th><th>State</th><th>Received</th><th>Payload</th></tr></thead><tbody>${signalRows}</tbody></table></div></section>` : ''}
+    </div>`;
+}
+
+async function renderSchedules() {
+  const [summary, data] = await Promise.all([api('/api/summary'), api('/api/schedules')]);
+  setMeta(summary);
+  const now = data.now;
+  const rows = data.schedules.map((s) => {
+    const st = s.paused ? 'paused' : (s.next_fire_at == null ? 'done' : 'active');
+    const buttons = [];
+    if (s.paused) buttons.push(`<button data-sched="resume" data-id="${esc(s.schedule_id)}">Resume</button>`);
+    else if (s.next_fire_at != null) buttons.push(`<button data-sched="pause" data-id="${esc(s.schedule_id)}">Pause</button>`);
+    buttons.push(`<button class="danger" data-sched="delete" data-id="${esc(s.schedule_id)}">Delete</button>`);
+    return `<tr>
+      <td class="mono">${esc(s.schedule_id)}</td>
+      <td><a href="#/runs?tag=${enc('sicim.schedule=' + s.schedule_id)}">${esc(s.workflow)}</a></td>
+      <td class="mono">${esc(s.spec)}${s.tz ? ` <span class="muted">${esc(s.tz)}</span>` : ''}</td>
+      <td>${badge(st)}</td>
+      <td>${s.paused ? '<span class="muted">–</span>' : when(s.next_fire_at, now)}</td>
+      <td>${s.last_run_id ? runLink(s.last_run_id) : '<span class="muted">–</span>'}</td>
+      <td>${esc(s.overlap)}</td>
+      <td>${tagChips(s.tags)}</td>
+      <td class="actions">${buttons.join('')}</td>
+    </tr>`;
+  }).join('');
+  app.innerHTML = data.schedules.length
+    ? `<div class="tablewrap"><table><thead><tr><th>Schedule</th><th>Workflow</th><th>Spec</th><th>State</th><th>Next fire</th><th>Last run</th><th>Overlap</th><th>Tags</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : '<div class="empty">No schedules. Create one with <code>rt.schedule(...)</code>.</div>';
+}
+
+// -- interactions ------------------------------------------------------------
+app.addEventListener('click', (ev) => {
+  const chip = ev.target.closest('[data-status]');
+  if (chip) {
+    const p = parseHash().params;
+    if (chip.dataset.status) p.set('status', chip.dataset.status); else p.delete('status');
+    go(runsHash(p));
+    return;
+  }
+  const filter = ev.target.closest('[data-tagfilter]');
+  if (filter) {
+    const p = parseHash().params;
+    if (!p.getAll('tag').includes(filter.dataset.tagfilter)) p.append('tag', filter.dataset.tagfilter);
+    go(runsHash(p));
+    return;
+  }
+  const untag = ev.target.closest('[data-untag]');
+  if (untag) {
+    const id = parseHash().id;
+    act('tag removed', () => api(`/api/runs/${enc(id)}/tags`, { method: 'POST', body: JSON.stringify({ tags: { [untag.dataset.untag]: null } }) }));
+    return;
+  }
+  const cancel = ev.target.closest('[data-cancel]');
+  if (cancel) {
+    const id = cancel.dataset.cancel;
+    if (confirm(`Cancel run ${id}? Its compensations will run.`)) act('cancel requested', () => api(`/api/runs/${enc(id)}/cancel`, { method: 'POST' }));
+    return;
+  }
+  const sched = ev.target.closest('[data-sched]');
+  if (sched) {
+    const { sched: action, id } = sched.dataset;
+    if (action === 'delete' && !confirm(`Delete schedule ${id}? Runs it already started are unaffected.`)) return;
+    const path = action === 'delete' ? `/api/schedules/${enc(id)}` : `/api/schedules/${enc(id)}/${action}`;
+    act(`schedule ${action}d`, () => api(path, { method: action === 'delete' ? 'DELETE' : 'POST' }));
+    return;
+  }
+  const row = ev.target.closest('tr.row');
+  if (row && !ev.target.closest('a')) {
+    const seq = Number(row.dataset.seq);
+    if (state.expanded.has(seq)) state.expanded.delete(seq); else state.expanded.add(seq);
+    render(true);
+  }
+});
+
+app.addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const fd = new FormData(form);
+  if (form.id === 'filters') {
+    const current = parseHash().params;
+    const next = new URLSearchParams();
+    if (current.get('status')) next.set('status', current.get('status'));
+    if (fd.get('workflow')) next.set('workflow', fd.get('workflow'));
+    String(fd.get('tags') || '').split(/[\s,]+/).filter(Boolean).forEach((t) => next.append('tag', t));
+    if (fd.get('parent')) next.set('parent', String(fd.get('parent')).trim());
+    if (fd.get('limit') !== '100') next.set('limit', fd.get('limit'));
+    if (fd.get('order') === 'oldest') next.set('order', 'oldest');
+    go(runsHash(next));
+  } else if (form.id === 'signal') {
+    const id = parseHash().id;
+    const text = String(fd.get('payload') || '').trim();
+    let payload = null;
+    if (text) {
+      try { payload = JSON.parse(text); } catch (e) { toast(`payload is not valid JSON: ${e.message}`, true); return; }
+    }
+    act('signal sent', () => api(`/api/runs/${enc(id)}/signal`, { method: 'POST', body: JSON.stringify({ name: String(fd.get('name')).trim(), payload }) }));
+  } else if (form.id === 'addtag') {
+    const id = parseHash().id;
+    const key = String(fd.get('key')).trim();
+    act('tag added', () => api(`/api/runs/${enc(id)}/tags`, { method: 'POST', body: JSON.stringify({ tags: { [key]: String(fd.get('value')) } }) }));
+  }
+});
+
+document.getElementById('jump').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const id = new FormData(ev.target).get('id').trim();
+  if (id) { ev.target.reset(); go(`#/runs/${enc(id)}`); }
+});
+document.getElementById('refresh').addEventListener('click', () => render(true));
+window.addEventListener('hashchange', () => render(true));
+setInterval(() => {
+  if (!auto.checked || document.hidden || state.busy) return;
+  const a = document.activeElement;
+  if (a && app.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+  render(true);
+}, 2000);
+render(true);
+})();
+</script>
+</body>
+</html>

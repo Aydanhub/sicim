@@ -40,6 +40,7 @@ from .store import (
     _schedule_from_row,
     _schedule_params,
     _schedule_update,
+    merge_tags,
 )
 
 logger = logging.getLogger("sicim")
@@ -370,6 +371,46 @@ class PostgresStore(Store):
                 await conn.execute(f"DELETE FROM {table} WHERE run_id = %s", (run_id,))
 
         await self._with_conn(op)
+
+    async def update_tags(self, run_id: str, tags) -> dict[str, str]:
+        update = dict(tags)
+        rows_sql = "INSERT INTO run_tags (run_id, tag_key, tag_value) VALUES (%s,%s,%s)"
+
+        async def op(conn):
+            # Read-merge-write under a row lock so concurrent taggers (other
+            # workers, the UI) never drop each other's keys.
+            async with conn.transaction():
+                cursor = await conn.execute(
+                    "SELECT tags FROM runs WHERE run_id = %s FOR UPDATE", (run_id,)
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    return {}
+                merged = merge_tags(serde.decode(row["tags"]) if row["tags"] else {}, update)
+                await conn.execute(
+                    "UPDATE runs SET tags = %s WHERE run_id = %s", (serde.encode(merged), run_id)
+                )
+                await conn.execute("DELETE FROM run_tags WHERE run_id = %s", (run_id,))
+                if merged:
+                    async with conn.cursor() as cur:
+                        await cur.executemany(rows_sql, [(run_id, k, v) for k, v in merged.items()])
+                return merged
+
+        return await self._with_conn(op)
+
+    async def count_runs(self) -> dict[str, int]:
+        async def op(conn):
+            cursor = await conn.execute("SELECT status, COUNT(*) AS n FROM runs GROUP BY status")
+            return await cursor.fetchall()
+
+        return {row["status"]: row["n"] for row in await self._with_conn(op)}
+
+    async def list_workflows(self) -> list[str]:
+        async def op(conn):
+            cursor = await conn.execute("SELECT DISTINCT workflow FROM runs ORDER BY workflow")
+            return await cursor.fetchall()
+
+        return [row["workflow"] for row in await self._with_conn(op)]
 
     # -- events --------------------------------------------------------------
 

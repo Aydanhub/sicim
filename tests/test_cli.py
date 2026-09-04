@@ -1,6 +1,14 @@
 """The ``python -m sicim`` CLI: run filters and schedule management."""
 
 import asyncio
+import json
+import re
+import signal
+import subprocess
+import sys
+import urllib.request
+
+import pytest
 
 from sicim import Runtime, SQLiteStore, workflow
 from sicim.__main__ import main
@@ -75,3 +83,47 @@ def test_schedule_commands(tmp_path, capsys):
     assert "schedule 'nightly' deleted" in capsys.readouterr().out
     main(["--db", db, "schedule", "list"])
     assert "(no schedules)" in capsys.readouterr().out
+
+
+def test_tag_command(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    seed(db)
+
+    main(["--db", db, "tag", "cli-a", "stage=review", "--remove", "env"])
+    assert capsys.readouterr().out.strip() == "tags:     customer=42,stage=review"
+    main(["--db", db, "list", "--tag", "stage=review"])
+    assert "cli-a" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--db", db, "tag", "cli-a"])
+    assert excinfo.value.code == 2
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--db", db, "tag", "missing", "k=v"])
+    assert excinfo.value.code == 1 and "no run with id" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--db", db, "tag", "cli-a", "sicim.schedule=x"])
+    assert excinfo.value.code == 1 and "reserved" in capsys.readouterr().err
+
+
+def test_ui_command_serves_until_interrupted(tmp_path):
+    db = str(tmp_path / "cli.db")
+    seed(db)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "sicim", "--db", db, "ui", "--port", "0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        line = proc.stdout.readline()
+        match = re.search(r"http://[^\s]+", line)
+        assert match, f"no URL in {line!r}"
+        with urllib.request.urlopen(match.group(0) + "/api/summary", timeout=5) as response:
+            summary = json.loads(response.read())
+        assert summary["counts"] == {"completed": 2} and summary["schedules"] == 1
+        with urllib.request.urlopen(match.group(0) + "/", timeout=5) as response:
+            assert b"<title>sicim</title>" in response.read()
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=10) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()

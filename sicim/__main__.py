@@ -3,9 +3,11 @@
 Usage:
     python -m sicim --db sicim.db list [--status running] [--workflow NAME] [--tag k=v ...] [--limit N]
     python -m sicim --db sicim.db show RUN_ID
+    python -m sicim --db sicim.db tag RUN_ID k=v [k2=v2 ...] [--remove k3 ...]
     python -m sicim --db sicim.db prune --older-than-days 30 [--dry-run]
     python -m sicim --db sicim.db schedule list
     python -m sicim --db sicim.db schedule pause|resume|delete SCHEDULE_ID
+    python -m sicim --db sicim.db ui [--host 127.0.0.1] [--port 8787]
 
 Every command also works against PostgreSQL via ``--pg DSN`` instead of ``--db``.
 """
@@ -18,6 +20,7 @@ import datetime as dt
 import sys
 import time
 
+from .errors import SicimError
 from .runtime import Runtime
 from .store import RunStatus, SQLiteStore, Store
 
@@ -102,6 +105,33 @@ async def _show(store: Store, run_id: str) -> None:
             print(f"  [{signal.seq:>3}] {signal.name:<20} {state:<9} {signal.payload!r}")
 
 
+async def _tag(store: Store, args: argparse.Namespace) -> None:
+    update: dict[str, str | None] = dict(args.tags)
+    for key in args.remove:
+        update[key] = None
+    if not update:
+        print("nothing to do: give KEY=VALUE pairs and/or --remove KEY", file=sys.stderr)
+        raise SystemExit(2)
+    rt = Runtime(store, scheduler=False)
+    try:
+        tags = await rt.tag(args.run_id, update)
+    except (SicimError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from None
+    print(f"tags:     {_fmt_tags(tags) or '(none)'}")
+
+
+async def _ui(store: Store, args: argparse.Namespace) -> None:
+    from .ui import start_ui
+
+    server = await start_ui(store, host=args.host, port=args.port)
+    print(f"sicim UI at {server.url}  (Ctrl-C to stop)", flush=True)
+    try:
+        await asyncio.Event().wait()  # until Ctrl-C cancels us
+    finally:
+        await server.aclose()
+
+
 async def _prune(store: Store, older_than_days: float, dry_run: bool) -> None:
     cutoff = time.time() - older_than_days * 86400
     victims = [
@@ -157,6 +187,10 @@ async def _amain(args: argparse.Namespace) -> None:
             await _show(store, args.run_id)
         elif args.command == "schedule":
             await _schedule(store, args)
+        elif args.command == "tag":
+            await _tag(store, args)
+        elif args.command == "ui":
+            await _ui(store, args)
         else:
             await _prune(store, args.older_than_days, args.dry_run)
     finally:
@@ -180,6 +214,13 @@ def main(argv: list[str] | None = None) -> None:
     p_list.add_argument("--limit", type=int, default=None, help="show only the newest N runs")
     p_show = sub.add_parser("show", help="show a run's record, journal and signals")
     p_show.add_argument("run_id")
+    p_tag = sub.add_parser("tag", help="add, replace or remove tags on a run")
+    p_tag.add_argument("run_id")
+    p_tag.add_argument("tags", nargs="*", type=_parse_tag, metavar="KEY=VALUE", help="tags to set")
+    p_tag.add_argument("--remove", action="append", default=[], metavar="KEY", help="tag key to remove (repeatable)")
+    p_ui = sub.add_parser("ui", help="serve the web monitoring UI until Ctrl-C")
+    p_ui.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
+    p_ui.add_argument("--port", type=int, default=8787, help="port (0 picks a free one)")
     p_prune = sub.add_parser(
         "prune", help="delete terminal runs (and their journals) older than a cutoff"
     )
@@ -195,7 +236,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if bool(args.db) == bool(args.pg):
         parser.error("exactly one of --db or --pg is required")
-    asyncio.run(_amain(args))
+    try:
+        asyncio.run(_amain(args))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from sicim.schedule import CronExpr, build_spec, parse_spec, scheduled_run_id
+from sicim.schedule import CronExpr, build_spec, parse_duration, parse_spec, scheduled_run_id
 
 UTC = dt.timezone.utc
 
@@ -127,3 +127,49 @@ def test_scheduled_run_id_is_deterministic_and_readable():
     assert scheduled_run_id("nightly", ts) == "nightly@2026-09-03T02:00:00.250Z"
     assert scheduled_run_id("nightly", ts) == scheduled_run_id("nightly", ts)
     assert scheduled_run_id("nightly", ts) != scheduled_run_id("nightly", ts + 0.001)
+
+
+# -- seconds field, @every and duration strings --------------------------------
+
+
+def test_leading_seconds_field():
+    assert nxt("*/10 * * * * *", at(2026, 9, 3, 10, 15, 33)) == dt.datetime(2026, 9, 3, 10, 15, 40, tzinfo=UTC)
+    assert nxt("*/10 * * * * *", at(2026, 9, 3, 10, 15, 40)) == dt.datetime(2026, 9, 3, 10, 15, 50, tzinfo=UTC)
+    assert nxt("*/10 * * * * *", at(2026, 9, 3, 10, 15, 59)) == dt.datetime(2026, 9, 3, 10, 16, 0, tzinfo=UTC)
+    assert nxt("30 5 * * * *", at(2026, 9, 3, 10, 5, 31)) == dt.datetime(2026, 9, 3, 11, 5, 30, tzinfo=UTC)
+    assert nxt("15 0 12 * * mon-fri", at(2026, 9, 5, 0, 0)) == dt.datetime(2026, 9, 7, 12, 0, 15, tzinfo=UTC)
+    assert CronExpr.parse("*/10 * * * * *").has_seconds is True
+    assert CronExpr.parse("* * * * *").has_seconds is False
+    assert CronExpr.parse("0 * * * * *").seconds == frozenset({0})
+    # Five-field expressions still fire on the minute.
+    assert nxt("* * * * *", at(2026, 9, 3, 10, 15, 33)).second == 0
+    with pytest.raises(ValueError):
+        CronExpr.parse("60 * * * * *")
+    with pytest.raises(ValueError):
+        CronExpr.parse("0 0 0 * * * *")  # seven fields
+
+
+@pytest.mark.parametrize(
+    "text, seconds",
+    [("90", 90.0), ("90s", 90.0), ("5m", 300.0), ("1h30m", 5400.0), ("1h 30m", 5400.0), ("2d12h", 216000.0),
+     ("1.5h", 5400.0), ("250ms", 0.25), ("1w", 604800.0), (" 10S ", 10.0)],
+)
+def test_parse_duration(text, seconds):
+    assert parse_duration(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["", "abc", "1h30", "5x", "-5s", "h", "1..5s"])
+def test_parse_duration_rejects_garbage(text):
+    with pytest.raises(ValueError):
+        parse_duration(text)
+
+
+def test_every_accepts_duration_strings_and_at_every_alias():
+    assert build_spec(every="5m") == build_spec(every=300) == build_spec(cron="@every 5m")
+    assert build_spec(cron="@every 90s").text == "every 90.0"
+    assert build_spec(cron="  @EVERY 1h30m ").seconds == 5400.0
+    assert parse_spec(build_spec(cron="@every 2d").text) == build_spec(every="2d")
+    for bad in ({"every": "abc"}, {"every": "0s"}, {"cron": "@every"}, {"cron": "@every 0m"},
+                {"cron": "@every 5m", "tz": "UTC"}, {"every": "5m", "tz": "UTC"}, {"at": 1.0, "tz": "UTC"}):
+        with pytest.raises(ValueError):
+            build_spec(**bad)

@@ -112,3 +112,19 @@ async def test_run_span_carries_tags(store):
 
     spans = {span.name: span for span in exporter.get_finished_spans()}
     assert spans["sicim.run wf_otel_tags"].attributes["sicim.tag.customer"] == "42"
+
+
+async def test_ctx_tag_updates_become_run_span_attributes(store):
+    tracer, exporter = make_tracer()
+    rt = Runtime(store, on_event=otel_observer(tracer))
+
+    @workflow(name="wf_otel_tags")
+    async def wf(ctx):
+        await ctx.tag({"stage": "review"})
+        return "ok"
+
+    await (await rt.start(wf, run_id="ot-tags", tags={"customer": "42"})).result()
+    await rt.shutdown()
+    [run_span] = [s for s in exporter.get_finished_spans() if s.name == "sicim.run wf_otel_tags"]
+    assert run_span.attributes["sicim.tag.customer"] == "42"
+    assert run_span.attributes["sicim.tag.stage"] == "review"

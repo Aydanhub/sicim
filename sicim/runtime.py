@@ -172,6 +172,12 @@ class Runtime:
     compare-and-set on the schedule make each tick start at most one run.
     Signal-only clients can pass ``scheduler=False``.
 
+    ``recover_interval`` (seconds; default None = off) makes the worker re-run
+    :meth:`recover` periodically in the background, so runs orphaned by a
+    crashed worker are taken over automatically once their leases expire —
+    without anyone calling ``recover()`` by hand. Like the scheduler loop it
+    starts on the first drive/recover/schedule call.
+
     ``on_event`` is an observability hook called as ``on_event(run_id, event)``
     after every journal append; exceptions it raises are logged and ignored.
     """
@@ -187,12 +193,15 @@ class Runtime:
         chain_keep: int | None = None,
         scheduler: bool = True,
         schedule_poll_interval: float = 1.0,
+        recover_interval: float | None = None,
         on_event: Callable[[str, Event], None] | None = None,
     ):
         if chain_keep is not None and chain_keep < 0:
             raise ValueError("chain_keep must be None or an int >= 0")
         if schedule_poll_interval <= 0:
             raise ValueError("schedule_poll_interval must be > 0")
+        if recover_interval is not None and recover_interval <= 0:
+            raise ValueError("recover_interval must be None or > 0")
         self.store = store or InMemoryStore()
         self.default_retry = default_retry or RetryPolicy()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
@@ -201,6 +210,7 @@ class Runtime:
         self.chain_keep = chain_keep
         self.scheduler = scheduler
         self.schedule_poll_interval = schedule_poll_interval
+        self.recover_interval = recover_interval
         self.on_event = on_event
         self._handles: dict[str, RunHandle] = {}
         self._waiters: dict[str, set[asyncio.Future]] = {}
@@ -210,7 +220,9 @@ class Runtime:
         self._subscription: Callable[[], Any] | None = None
         self._subscribe_attempted = False
         self._scheduler_task: asyncio.Task | None = None
+        self._recover_task: asyncio.Task | None = None
         self._unregistered_warned: set[str] = set()
+        self._unregistered_workflows: set[str] = set()
         self._closing = False
 
     # -- public API ----------------------------------------------------------
@@ -229,6 +241,7 @@ class Runtime:
         arguments are ignored. ``tags`` (``str -> str``) are pinned to the run
         for :meth:`list_runs` searches; ``run_id`` and ``tags`` are reserved
         keywords, every other keyword argument goes to the workflow."""
+        validate_tags(tags, allow_reserved=False)
         return await self._start(wf, args, kwargs, run_id=run_id, parent_run_id=None, tags=tags)
 
     async def _start(
@@ -282,18 +295,32 @@ class Runtime:
         """Resume every claimable incomplete run in the store.
 
         Runs leased by another live worker are skipped; they become claimable
-        here once that worker releases them or its lease expires.
+        here once that worker releases them or its lease expires. Runs of
+        workflows not registered in this process are left alone (warned once
+        per workflow) for a worker that has the code.
         """
-        self._ensure_scheduler()
+        self._ensure_background()
         records = await self.store.list_runs(status=RunStatus.RUNNING)
-        handles = []
+        handles, claimed = [], 0
         for record in records:
+            live = self._handles.get(record.run_id)
+            if live is not None and not live.done():
+                handles.append(live)  # already driven here
+                continue
             try:
                 handles.append(await self._ensure(record))
+                claimed += 1
             except LeaseUnavailable:
                 logger.debug("[%s] leased elsewhere; skipping recover", record.run_id)
-        if handles:
-            logger.info("recovered %d incomplete run(s)", len(handles))
+            except WorkflowNotFound:
+                if record.workflow not in self._unregistered_workflows:
+                    self._unregistered_workflows.add(record.workflow)
+                    logger.warning(
+                        "workflow '%s' is not registered in this worker; leaving its runs alone (e.g. '%s')",
+                        record.workflow, record.run_id,
+                    )
+        if claimed:
+            logger.info("recovered %d incomplete run(s)", claimed)
         return handles
 
     async def signal(self, run_id: str, name: str, payload: Any = None) -> None:
@@ -312,6 +339,13 @@ class Runtime:
                 await self._ensure(record)
             except LeaseUnavailable:
                 pass  # another worker drives it; its inbox poll picks the signal up
+            except WorkflowNotFound:
+                # No code for it here: the signal is persisted and consumed by
+                # the worker driving (or next recovering) the run.
+                logger.info(
+                    "[%s] signal '%s' queued; workflow '%s' is not registered in this process",
+                    record.run_id, name, record.workflow,
+                )
         self._wake(record.run_id)
 
     async def cancel(self, run_id: str) -> None:
@@ -334,6 +368,15 @@ class Runtime:
                 await self._ensure(record)
             except LeaseUnavailable:
                 pass  # the driving worker sees the persisted flag via its heartbeat
+            except WorkflowNotFound:
+                # No code for it here: the persisted flag takes effect when a
+                # worker with the code drives the run.
+                logger.info(
+                    "[%s] cancel requested; workflow '%s' is not registered in this process",
+                    run_id, record.workflow,
+                )
+                self._cancel_flags.pop(run_id, None)
+                self._cancel_events.pop(run_id, None)
         self._wake(run_id)
 
     async def status(self, run_id: str) -> RunRecord:
@@ -362,6 +405,28 @@ class Runtime:
             limit=limit,
             newest_first=newest_first,
         )
+
+    async def tag(self, run_id: str, tags: Mapping[str, str | None]) -> dict[str, str]:
+        """Add, replace or remove (value ``None``) search tags on an existing
+        run — at any status — and return its resulting tags.
+
+        A run that continued-as-new is followed to the live end of its chain;
+        successors created afterwards carry the tags on. The workflow body
+        does not see tags added this way (``ctx.tags`` stays deterministic);
+        use ``ctx.tag()`` inside the workflow for that. Keys starting with
+        ``sicim.`` are reserved.
+        """
+        update = validate_tags(tags, allow_none=True, allow_reserved=False)
+        record = await self._follow_chain(await self._load(run_id))
+        return await self.store.update_tags(record.run_id, update)
+
+    async def list_workflows(self) -> list[str]:
+        """Distinct workflow names that have runs in the store."""
+        return await self.store.list_workflows()
+
+    async def count_runs(self) -> dict[str, int]:
+        """Number of runs per status value."""
+        return await self.store.count_runs()
 
     # -- schedules -----------------------------------------------------------
 
@@ -406,7 +471,7 @@ class Runtime:
                 args=serde.roundtrip(list(args)) or [],
                 kwargs=serde.roundtrip(kwargs) or {},
                 tz=tz,
-                tags=validate_tags(tags),
+                tags=validate_tags(tags, allow_reserved=False),
                 overlap=overlap,
                 next_fire_at=spec.first_fire_at(time.time()),
             )
@@ -424,7 +489,7 @@ class Runtime:
                 f"schedule '{schedule_id}' already exists for workflow '{existing.workflow}', "
                 f"cannot schedule it as '{name}'"
             )
-        self._ensure_scheduler()
+        self._ensure_background()
         return existing
 
     async def get_schedule(self, schedule_id: str) -> ScheduleRecord:
@@ -448,7 +513,7 @@ class Runtime:
         await self.store.update_schedule(
             schedule_id, paused=False, next_fire_at=spec.next_after(time.time())
         )
-        self._ensure_scheduler()
+        self._ensure_background()
 
     async def unschedule(self, schedule_id: str) -> None:
         """Delete a schedule; runs it already started are unaffected."""
@@ -464,8 +529,9 @@ class Runtime:
         """
         self._closing = True
         tasks = [h._task for h in self._handles.values() if h._task is not None and not h._task.done()]
-        if self._scheduler_task is not None and not self._scheduler_task.done():
-            tasks.append(self._scheduler_task)
+        for loop_task in (self._scheduler_task, self._recover_task):
+            if loop_task is not None and not loop_task.done():
+                tasks.append(loop_task)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -560,12 +626,14 @@ class Runtime:
                 # A shutting-down runtime spawns nothing (crash-equivalence);
                 # recover() on the next runtime picks the run up.
                 return RunHandle(record.run_id, record=record, runtime=self)
+            # Resolve the code before taking the lease: a process without this
+            # workflow must never end up holding (and blocking) the run's lease.
+            wf = get_workflow(record.workflow)
             if not await self.store.try_acquire_lease(record.run_id, self.worker_id, self.lease_ttl):
                 lease = await self.store.load_lease(record.run_id)
                 raise LeaseUnavailable(record.run_id, lease[0] if lease else None)
             await self._ensure_subscribed()
-            self._ensure_scheduler()
-            wf = get_workflow(record.workflow)
+            self._ensure_background()
             events = await self.store.load_events(record.run_id)
             journal = Journal(record.run_id, self.store, events, on_append=self.on_event)
             ctx = WorkflowContext(
@@ -610,7 +678,10 @@ class Runtime:
                 started["parent"] = record.parent_run_id
             if record.tags:
                 started["tags"] = record.tags
-            await journal.append_once(Kind.RUN_STARTED, -1, started)
+            started_event = await journal.append_once(Kind.RUN_STARTED, -1, started)
+            # The body sees the tags pinned in the journal (plus its own
+            # ctx.tag() updates as they replay), never later external edits.
+            ctx._tags = dict(started_event.payload.get("tags") or {})
             try:
                 result = await wf(ctx, *record.args, **record.kwargs)
                 result = serde.roundtrip(result)
@@ -645,6 +716,7 @@ class Runtime:
                     {"next_run_id": next_id, "args": serde.preview(cont.next_args)},
                 )
                 if await self.store.load_run(next_id) is None:
+                    current = await self.store.load_run(run_id)  # tags may have changed since start
                     await self.store.create_run(
                         RunRecord(
                             run_id=next_id,
@@ -653,7 +725,7 @@ class Runtime:
                             args=cont.next_args,
                             kwargs=cont.next_kwargs,
                             parent_run_id=record.parent_run_id,
-                            tags=record.tags,
+                            tags=current.tags if current is not None else record.tags,
                         )
                     )
                 await self.store.update_run(run_id, status=RunStatus.CONTINUED, continued_to=next_id)
@@ -753,12 +825,29 @@ class Runtime:
 
     # -- scheduler -----------------------------------------------------------
 
-    def _ensure_scheduler(self) -> None:
-        """Start this worker's schedule-firing loop (once; opt-out via ``scheduler=False``)."""
-        if not self.scheduler or self._closing or self._scheduler_task is not None:
+    def _ensure_background(self) -> None:
+        """Start this worker's background loops, once each: the schedule-firing
+        loop (opt-out via ``scheduler=False``) and the orphan-recovery loop
+        (opt-in via ``recover_interval``)."""
+        if self._closing:
             return
-        self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="sicim-scheduler")
-        self._scheduler_task.add_done_callback(self._retrieve_exception)
+        if self.scheduler and self._scheduler_task is None:
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="sicim-scheduler")
+            self._scheduler_task.add_done_callback(self._retrieve_exception)
+        if self.recover_interval is not None and self._recover_task is None:
+            self._recover_task = asyncio.create_task(self._recover_loop(), name="sicim-recover")
+            self._recover_task.add_done_callback(self._retrieve_exception)
+
+    async def _recover_loop(self) -> None:
+        """Periodically take over claimable orphaned runs (``recover_interval``)."""
+        while True:
+            await asyncio.sleep(self.recover_interval)
+            try:
+                await self.recover()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("periodic recover failed; retrying in %.1fs", self.recover_interval)
 
     async def _scheduler_loop(self) -> None:
         while True:

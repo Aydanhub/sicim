@@ -39,25 +39,50 @@ class RunStatus(str, enum.Enum):
         return self is not RunStatus.RUNNING
 
 
-def validate_tags(tags: Mapping[str, str] | None) -> dict[str, str]:
+#: Tag keys under this prefix belong to the runtime (``sicim.schedule`` marks
+#: runs started by a schedule); user-facing APIs reject them.
+RESERVED_TAG_PREFIX = "sicim."
+
+
+def validate_tags(
+    tags: Mapping[str, Any] | None, *, allow_none: bool = False, allow_reserved: bool = True
+) -> dict[str, Any]:
     """Normalize run/schedule tags: a flat ``str -> str`` mapping.
 
-    Tags are search keys (``list_runs(tags={...})``) pinned when a run is
-    created. Keys starting with ``sicim.`` are reserved for the runtime
-    (``sicim.schedule`` marks runs started by a schedule).
+    Tags are search keys (``list_runs(tags={...})``) set when a run is created
+    and editable later (``Runtime.tag``, ``ctx.tag``). With ``allow_none`` a
+    value of None is accepted (in an update it means "remove this key"); with
+    ``allow_reserved=False`` keys under :data:`RESERVED_TAG_PREFIX` raise
+    ``ValueError``.
     """
     if tags is None:
         return {}
     if not isinstance(tags, Mapping):
         raise TypeError("tags must be a mapping of str -> str")
-    normalized: dict[str, str] = {}
+    normalized: dict[str, Any] = {}
     for key, value in tags.items():
         if not isinstance(key, str) or not key:
             raise TypeError("tag keys must be non-empty strings")
+        if not allow_reserved and key.startswith(RESERVED_TAG_PREFIX):
+            raise ValueError(f"tag key {key!r} is reserved (prefix {RESERVED_TAG_PREFIX!r})")
+        if value is None and allow_none:
+            normalized[key] = None
+            continue
         if not isinstance(value, str):
             raise TypeError(f"tag {key!r} must map to a string, got {type(value).__name__}")
         normalized[key] = value
     return normalized
+
+
+def merge_tags(current: Mapping[str, str], update: Mapping[str, str | None]) -> dict[str, str]:
+    """Apply a tag update: set the given pairs, drop keys whose value is None."""
+    merged = dict(current)
+    for key, value in update.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
 
 
 @dataclass
@@ -166,6 +191,23 @@ class Store(abc.ABC):
         """Search runs. Every given filter must match; ``tags`` means *all* of
         the given pairs. Ordered by creation time, oldest first unless
         ``newest_first``; ``limit`` caps the result."""
+
+    @abc.abstractmethod
+    async def update_tags(self, run_id: str, tags: Mapping[str, str | None]) -> dict[str, str]:
+        """Merge ``tags`` into a run's tags (a value of None removes the key),
+        keeping the search index in step, and return the run's resulting
+        tags — empty when the run does not exist."""
+
+    async def count_runs(self) -> dict[str, int]:
+        """Number of runs per status value (statuses without runs are absent)."""
+        counts: dict[str, int] = {}
+        for record in await self.list_runs():
+            counts[record.status.value] = counts.get(record.status.value, 0) + 1
+        return counts
+
+    async def list_workflows(self) -> list[str]:
+        """Sorted distinct workflow names that have runs."""
+        return sorted({record.workflow for record in await self.list_runs()})
 
     @abc.abstractmethod
     async def append_event(self, run_id: str, event: Event) -> None: ...
@@ -421,6 +463,13 @@ class InMemoryStore(Store):
     async def delete_run_history(self, run_id: str) -> None:
         self._events.pop(run_id, None)
         self._signals.pop(run_id, None)
+
+    async def update_tags(self, run_id: str, tags: Mapping[str, str | None]) -> dict[str, str]:
+        record = self._runs.get(run_id)
+        if record is None:
+            return {}
+        record.tags = merge_tags(record.tags, tags)
+        return dict(record.tags)
 
     async def list_runs(
         self, status=None, *, workflow=None, tags=None, parent_run_id=None, limit=None, newest_first=False
@@ -750,6 +799,26 @@ class SQLiteStore(Store):
 
         await self._run(op)
 
+    async def update_tags(self, run_id: str, tags: Mapping[str, str | None]) -> dict[str, str]:
+        update = dict(tags)
+
+        def op():
+            row = self._conn.execute("SELECT tags FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                return {}
+            merged = merge_tags(serde.decode(row["tags"]) if row["tags"] else {}, update)
+            self._conn.execute("UPDATE runs SET tags = ? WHERE run_id = ?", (serde.encode(merged), run_id))
+            self._conn.execute("DELETE FROM run_tags WHERE run_id = ?", (run_id,))
+            if merged:
+                self._conn.executemany(
+                    "INSERT INTO run_tags (run_id, tag_key, tag_value) VALUES (?,?,?)",
+                    [(run_id, key, value) for key, value in merged.items()],
+                )
+            self._conn.commit()
+            return merged
+
+        return await self._run(op)
+
     async def list_runs(
         self, status=None, *, workflow=None, tags=None, parent_run_id=None, limit=None, newest_first=False
     ) -> list[RunRecord]:
@@ -757,6 +826,20 @@ class SQLiteStore(Store):
 
         def op():
             return [self._row_to_record(r) for r in self._conn.execute(sql, params).fetchall()]
+
+        return await self._run(op)
+
+    async def count_runs(self) -> dict[str, int]:
+        def op():
+            rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM runs GROUP BY status").fetchall()
+            return {row["status"]: row["n"] for row in rows}
+
+        return await self._run(op)
+
+    async def list_workflows(self) -> list[str]:
+        def op():
+            rows = self._conn.execute("SELECT DISTINCT workflow FROM runs ORDER BY workflow").fetchall()
+            return [row["workflow"] for row in rows]
 
         return await self._run(op)
 

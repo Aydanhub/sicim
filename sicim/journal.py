@@ -67,6 +67,9 @@ class Kind:
     # Deterministic values (now / random / uuid)
     VALUE_RECORDED = "value_recorded"
 
+    # Search tags changed from inside the workflow (ctx.tag)
+    TAGS_UPDATED = "tags_updated"
+
 
 #: Kinds that define an operation slot; used for non-determinism detection.
 DEFINING_KINDS = frozenset(
@@ -77,6 +80,7 @@ DEFINING_KINDS = frozenset(
         Kind.VALUE_RECORDED,
         Kind.COMP_REGISTERED,
         Kind.CHILD_SCHEDULED,
+        Kind.TAGS_UPDATED,
     }
 )
 

@@ -246,6 +246,27 @@ async def test_cron_schedule_targets_the_next_matching_minute(rt):
     assert (await rt.get_schedule("cron5")).next_fire_at == sched.next_fire_at
 
 
+async def test_cron_with_seconds_field_fires_every_second(store):
+    rt = Runtime(store, schedule_poll_interval=0.02)
+    sched = await rt.schedule(quick, schedule_id="secs", cron="* * * * * *", overlap="allow")
+    assert sched.spec == "cron * * * * * *"
+    assert 0 < sched.next_fire_at - time.time() <= 1.0
+    runs = await wait_for_runs(rt, "secs", 2)
+    fired = sorted(dt.datetime.fromisoformat(run.run_id.split("@", 1)[1].replace("Z", "+00:00")) for run in runs)
+    assert all(stamp.microsecond == 0 for stamp in fired)  # whole seconds
+    assert (fired[1] - fired[0]).total_seconds() == 1.0
+    await rt.unschedule("secs")
+    await rt.shutdown()
+
+
+async def test_at_every_alias_is_stored_as_an_interval(rt):
+    sched = await rt.schedule(quick, schedule_id="alias", cron="@every 10m")
+    assert sched.spec == "every 600.0" and sched.tz is None
+    assert 599 < sched.next_fire_at - time.time() <= 600
+    sched = await rt.schedule(quick, schedule_id="alias2", every="1h30m")
+    assert sched.spec == "every 5400.0"
+
+
 async def test_scheduler_can_be_disabled(store):
     rt = Runtime(store, scheduler=False, schedule_poll_interval=0.02)
     await rt.schedule(quick, schedule_id="noop", every=0.05)

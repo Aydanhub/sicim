@@ -122,3 +122,59 @@ async def test_cancel_from_another_worker_via_heartbeat(store):
     assert order == ["c1"]
     assert (await rt2.status("L5")).status is RunStatus.CANCELLED
     await rt1.shutdown()
+
+
+async def test_process_without_the_code_never_holds_the_lease(store, caplog):
+    from sicim import RunRecord, WorkflowNotFound
+
+    await store.create_run(RunRecord(run_id="L6", workflow="wf_not_registered_here"))
+    rt = Runtime(store, worker_id="ui")
+    with pytest.raises(WorkflowNotFound):
+        await rt.resume("L6")
+    assert await store.load_lease("L6") is None  # the failed resume left no lease behind
+
+    # recover() skips it (with one warning) instead of blowing up ...
+    assert await rt.recover() == []
+    assert await rt.recover() == []
+    assert sum("not registered" in record.message for record in caplog.records) == 1
+    # ... and signal/cancel are persisted for a worker that has the code.
+    await rt.signal("L6", "go", {"n": 1})
+    [signal] = await store.load_signals("L6")
+    assert (signal.name, signal.payload) == ("go", {"n": 1})
+    await rt.cancel("L6")
+    assert (await store.load_run("L6")).cancel_requested is True
+    assert await store.load_lease("L6") is None
+    assert rt._cancel_flags == {} and rt._cancel_events == {}
+    await rt.shutdown()
+
+
+async def test_recover_interval_takes_over_orphaned_runs(store):
+    gate = Gate()
+
+    @workflow(name="wf_lease_autorecover")
+    async def wf(ctx):
+        return await ctx.step(gate, name="gate")
+
+    rt1 = Runtime(store, worker_id="w1")
+    await rt1.start(wf, run_id="L7")
+    await gate.wait_reached()
+
+    rt2 = Runtime(store, worker_id="w2", recover_interval=0.05)
+    assert await rt2.recover() == []  # still leased by w1; this also starts w2's recover loop
+    assert rt2._recover_task is not None
+    await rt1.shutdown()  # w1 dies (lease released); nobody calls recover() again ...
+
+    deadline = asyncio.get_running_loop().time() + 5
+    while not (await store.load_run("L7")).status.terminal:
+        assert asyncio.get_running_loop().time() < deadline, "w2 never took the orphan over"
+        await asyncio.sleep(0.01)
+    assert "L7" in rt2._handles  # ... yet w2 picked it up and drove it to the end
+    assert await (await rt2.resume("L7")).result() == "gate-2"
+    assert gate.calls == 2
+    await rt2.shutdown()
+    assert rt2._recover_task.done()
+
+
+async def test_recover_interval_is_validated():
+    with pytest.raises(ValueError):
+        Runtime(recover_interval=0)

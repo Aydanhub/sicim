@@ -40,6 +40,7 @@ from .errors import (
 )
 from .journal import Event, Journal, Kind
 from .retry import RetryPolicy
+from .store import merge_tags, validate_tags
 from .workflow import WorkflowFn, workflow_name
 
 if TYPE_CHECKING:
@@ -160,8 +161,34 @@ class WorkflowContext:
 
     @property
     def tags(self) -> Mapping[str, str]:
-        """The run's search tags, pinned at start (read-only). Child
-        workflows inherit them unless ``ctx.child(..., tags=...)`` overrides."""
+        """The run's search tags as the workflow sees them (read-only): the
+        set pinned at start plus this run's own journaled ``ctx.tag()``
+        updates — identical on replay. Tags added from outside
+        (``Runtime.tag``) are deliberately *not* reflected here. Child
+        workflows inherit this view unless ``ctx.child(..., tags=...)``
+        overrides."""
+        return types.MappingProxyType(self._tags)
+
+    def tag(self, tags: Mapping[str, str | None]) -> Awaitable[Mapping[str, str]]:
+        """Add, replace or remove (value ``None``) search tags on this run as a
+        journaled operation: the store is updated on live execution and skipped
+        on replay, and ``ctx.tags`` reflects the change either way — so an
+        agent can label its own progress (``await ctx.tag({"stage": "review"})``)
+        and ``list_runs(tags=...)`` finds it. Keys starting with ``sicim.`` are
+        reserved. Returns the resulting tags."""
+        update = validate_tags(tags, allow_none=True, allow_reserved=False)
+        op_id = self._next_op()
+        return self._tag(op_id, update)
+
+    async def _tag(self, op_id: int, update: dict[str, str | None]) -> Mapping[str, str]:
+        recorded = self._expect(Kind.TAGS_UPDATED, op_id)
+        if recorded is None:
+            self._check_cancel()
+            # Store first, journal second: a crash in between replays both,
+            # and merging the same update twice is harmless.
+            await self._runtime.store.update_tags(self.run_id, update)
+            recorded = await self._journal.append(Kind.TAGS_UPDATED, op_id, {"tags": update})
+        self._tags = merge_tags(self._tags, recorded.payload["tags"])
         return types.MappingProxyType(self._tags)
 
     async def _finish_backoff(self, last_failure: Event | None, *, cancellable: bool = True) -> None:
@@ -448,6 +475,8 @@ class WorkflowContext:
         inherits the parent's ``tags`` unless given its own, so a search by
         tag finds the whole agent tree.
         """
+        if tags is not None:
+            validate_tags(tags, allow_reserved=False)
         op_id = self._next_op()
         return self._child(
             op_id,
