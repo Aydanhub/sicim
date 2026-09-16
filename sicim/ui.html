@@ -45,6 +45,9 @@ button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
 button.danger { color: var(--err); }
 button.danger:hover { border-color: var(--err); }
+button.rewind { padding: 0 4px; line-height: 1.2; border-color: transparent; background: none; color: var(--muted); opacity: 0; }
+tr.row:hover button.rewind { opacity: 1; }
+button.rewind:hover { color: var(--accent); border-color: var(--accent); }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; user-select: none; }
 .chip.active { border-color: var(--accent); background: var(--accent-bg); }
@@ -194,6 +197,21 @@ async function act(label, fn) {
     toast(e.message, true);
   }
 }
+async function resetRun(id, toOp, force = false) {
+  try {
+    await api(`/api/runs/${enc(id)}/reset`, { method: 'POST', body: JSON.stringify({ to_op: toOp, force }) });
+    toast(toOp == null ? 'run reset' : `run rewound to op ${toOp}`);
+    await render(true);
+  } catch (e) {
+    // Compensations have already run: the operator decides whether their
+    // effects can be lived with (or re-applied by hand).
+    if (!force && /compensations/.test(e.message) && confirm(`${e.message}\n\nReset anyway?`)) {
+      await resetRun(id, toOp, true);
+      return;
+    }
+    toast(e.message, true);
+  }
+}
 function setMeta(summary) {
   meta.textContent = `v${summary.version} · ${summary.store} · ${summary.worker_id}`;
 }
@@ -312,6 +330,7 @@ function summarize(e, now) {
     case 'run_failed': return `${errText(p.error)}${p.compensation_failures ? ` · ${p.compensation_failures.length} compensation(s) failed` : (p.compensated ? ' · compensated' : '')}`;
     case 'run_cancelled': return p.compensation_failures ? `${p.compensation_failures.length} compensation(s) failed` : 'compensations applied';
     case 'run_continued': return `→ ${runLink(p.next_run_id)} · args ${esc(p.args || '[]')}`;
+    case 'run_reset': return `rewound to op ${p.to_op} · ${p.dropped} event(s) dropped · was ${esc(p.from_status || '?')}${p.worker ? ' · by ' + esc(p.worker) : ''}`;
     case 'step_scheduled': return `${name} ${esc(p.args || '')}${p.compensation ? ` · compensate <b>${esc(p.compensation)}</b>` : ''}`;
     case 'step_attempt_failed': return `${name} attempt ${p.attempt}: ${errText(p.error)} · retry ${esc(rel(p.retry_at, now))}`;
     case 'step_completed': return `${name}${p.attempts > 1 ? ` (${p.attempts} attempts)` : ''} → ${esc(shortJson(p.result))}`;
@@ -350,7 +369,7 @@ async function renderRun(id) {
         <td class="num muted">${e.seq}</td>
         <td class="num" title="${esc(ts(e.ts))}">+${(e.ts - first).toFixed(3)}s</td>
         <td class="${cls}${failed ? ' bad' : ''}">${esc(e.kind)}</td>
-        <td class="num muted">${e.op_id >= 0 ? e.op_id : ''}</td>
+        <td class="num muted">${e.op_id >= 0 ? `${e.op_id} <button class="rewind" data-resetop="${e.op_id}" title="Rewind the run to op ${e.op_id} and replay from there">⟲</button>` : ''}</td>
         <td>${summarize(e, now)}</td>
       </tr>${open ? `<tr class="detail"><td colspan="5">${pretty(e.payload)}</td></tr>` : ''}`;
   }).join('');
@@ -375,6 +394,7 @@ async function renderRun(id) {
       ${badge(run.status)}
       ${run.cancel_requested && running ? '<span class="muted">cancel requested…</span>' : ''}
       ${running && !run.cancel_requested ? `<button class="danger" data-cancel="${esc(run.run_id)}">Cancel run</button>` : ''}
+      ${run.status === 'continued' ? '' : `<button data-reset="${esc(run.run_id)}" title="Rewind the journal to the first failed operation (or to the start) and replay">Reset run</button>`}
     </div>
     <div class="grid">
       <section class="card"><h2>Record</h2><dl>
@@ -453,6 +473,20 @@ app.addEventListener('click', (ev) => {
   if (untag) {
     const id = parseHash().id;
     act('tag removed', () => api(`/api/runs/${enc(id)}/tags`, { method: 'POST', body: JSON.stringify({ tags: { [untag.dataset.untag]: null } }) }));
+    return;
+  }
+  const resetOp = ev.target.closest('[data-resetop]');
+  if (resetOp) {
+    ev.stopPropagation();
+    const id = parseHash().id;
+    const op = Number(resetOp.dataset.resetop);
+    if (confirm(`Rewind run ${id} to op ${op}? Everything journaled at op ${op} and later is dropped and replayed live.`)) resetRun(id, op);
+    return;
+  }
+  const reset = ev.target.closest('[data-reset]');
+  if (reset) {
+    const id = reset.dataset.reset;
+    if (confirm(`Reset run ${id}? It rewinds to the first failed operation (or to the start) and replays from there.`)) resetRun(id, null);
     return;
   }
   const cancel = ev.target.closest('[data-cancel]');

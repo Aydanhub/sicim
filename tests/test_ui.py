@@ -154,6 +154,28 @@ async def test_signal_cancel_and_tags_through_the_api(store):
     await rt.shutdown()
 
 
+async def test_reset_through_the_api(store):
+    rt = Runtime(store)
+    assert await (await rt.start(parent, "v", run_id="ui-reset")).result() == ["v", "done"]
+
+    async with await start_ui(rt, port=0) as server:
+        assert (await call(server.url + "/api/runs/ui-reset/reset", "POST", {"to_op": -1}))[0] == 400
+        assert (await call(server.url + "/api/runs/ui-reset/reset", "POST", {"to_op": "x"}))[0] == 400
+        assert (await call(server.url + "/api/runs/missing/reset", "POST", {}))[0] == 404
+
+        status, body = await call(server.url + "/api/runs/ui-reset/reset", "POST", {"to_op": 0})
+        assert status == 200 and body["run"]["status"] == "running"
+
+        deadline = asyncio.get_running_loop().time() + 5
+        while (record := await rt.status("ui-reset")).status is RunStatus.RUNNING:
+            assert asyncio.get_running_loop().time() < deadline, "reset run never finished"
+            await asyncio.sleep(0.02)
+        assert record.status is RunStatus.COMPLETED and record.result == ["v", "done"]
+        status, detail = await call(server.url + "/api/runs/ui-reset")
+        assert [e for e in detail["events"] if e["kind"] == Kind.RUN_RESET]
+    await rt.shutdown()
+
+
 async def test_schedules_through_the_api(rt):
     await rt.schedule(child, "tick", schedule_id="ui-sched", cron="0 3 * * *", tz="Europe/Istanbul", tags={"team": "ops"})
     async with await start_ui(rt, port=0) as server:
@@ -189,6 +211,12 @@ async def test_bare_store_ui_persists_actions_without_touching_leases(store):
         assert await store.load_lease("ghost") is None
         status, detail = await call(server.url + "/api/runs/ghost")
         assert detail["run"]["status"] == "running" and len(detail["signals"]) == 1
+        # Reset works here too: it rewinds and hands the run back, unleased,
+        # to whichever worker actually has the workflow code.
+        status, body = await call(server.url + "/api/runs/ghost/reset", "POST", {})
+        assert status == 200 and body["run"]["status"] == "running"
+        assert body["run"]["cancel_requested"] is False
+        assert await store.load_lease("ghost") is None
 
 
 async def test_server_rejects_garbage_and_oversized_bodies(store):

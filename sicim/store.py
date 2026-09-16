@@ -216,13 +216,25 @@ class Store(abc.ABC):
     async def load_events(self, run_id: str) -> list[Event]: ...
 
     @abc.abstractmethod
+    async def replace_events(self, run_id: str, events: list[Event]) -> None:
+        """Atomically replace a run's journal with ``events`` (already
+        renumbered from seq 0).
+
+        Only :meth:`Runtime.reset` uses this — rewinding a run means dropping
+        the events after a chosen operation. Normal execution only ever
+        appends.
+        """
+
+    @abc.abstractmethod
     async def append_signal(self, run_id: str, name: str, payload: Any) -> int: ...
 
     @abc.abstractmethod
     async def load_signals(self, run_id: str) -> list[SignalRecord]: ...
 
     @abc.abstractmethod
-    async def mark_signal_consumed(self, run_id: str, seq: int) -> None: ...
+    async def mark_signal_consumed(self, run_id: str, seq: int, consumed: bool = True) -> None:
+        """Mark a buffered signal consumed — or, with ``consumed=False``,
+        available again (a reset that dropped its consumption)."""
 
     # -- worker leases -------------------------------------------------------
     # A lease grants one worker the exclusive right to drive a run. Acquiring
@@ -496,6 +508,9 @@ class InMemoryStore(Store):
     async def load_events(self, run_id: str) -> list[Event]:
         return list(self._events.get(run_id, []))
 
+    async def replace_events(self, run_id: str, events: list[Event]) -> None:
+        self._events[run_id] = list(events)
+
     async def append_signal(self, run_id: str, name: str, payload: Any) -> int:
         inbox = self._signals.setdefault(run_id, [])
         seq = len(inbox)
@@ -505,11 +520,11 @@ class InMemoryStore(Store):
     async def load_signals(self, run_id: str) -> list[SignalRecord]:
         return list(self._signals.get(run_id, []))
 
-    async def mark_signal_consumed(self, run_id: str, seq: int) -> None:
+    async def mark_signal_consumed(self, run_id: str, seq: int, consumed: bool = True) -> None:
         inbox = self._signals.get(run_id, [])
         for i, sig in enumerate(inbox):
             if sig.seq == seq:
-                inbox[i] = dataclasses.replace(sig, consumed=True)
+                inbox[i] = dataclasses.replace(sig, consumed=consumed)
                 return
 
     async def try_acquire_lease(self, run_id: str, owner: str, ttl: float) -> bool:
@@ -867,6 +882,20 @@ class SQLiteStore(Store):
 
         return await self._run(op)
 
+    async def replace_events(self, run_id: str, events: list[Event]) -> None:
+        rows = [
+            (run_id, e.seq, e.kind, e.op_id, serde.encode(e.payload), e.ts) for e in events
+        ]
+
+        def op():
+            self._conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+            self._conn.executemany(
+                "INSERT INTO events (run_id, seq, kind, op_id, payload, ts) VALUES (?,?,?,?,?,?)", rows
+            )
+            self._conn.commit()
+
+        await self._run(op)
+
     # -- signals -------------------------------------------------------------
 
     async def append_signal(self, run_id: str, name: str, payload: Any) -> int:
@@ -902,10 +931,11 @@ class SQLiteStore(Store):
 
         return await self._run(op)
 
-    async def mark_signal_consumed(self, run_id: str, seq: int) -> None:
+    async def mark_signal_consumed(self, run_id: str, seq: int, consumed: bool = True) -> None:
         def op():
             self._conn.execute(
-                "UPDATE signals SET consumed = 1 WHERE run_id = ? AND seq = ?", (run_id, seq)
+                "UPDATE signals SET consumed = ? WHERE run_id = ? AND seq = ?",
+                (int(consumed), run_id, seq),
             )
             self._conn.commit()
 

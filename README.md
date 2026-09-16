@@ -267,7 +267,7 @@ python -m sicim --db sicim.db ui                 # http://127.0.0.1:8787
 python -m sicim --pg postgresql://… ui --port 9000
 ```
 
-Sıfır bağımlılıklı, standart kütüphaneyle yazılmış bir web arayüzü: durum sayaçları ve durum/workflow/etiket/ebeveyn süzgeçli run listesi; run ayrıntısı (kayıt, etiketler, girdi/çıktı, kira, çocuklar, sinyaller ve tıklayınca payload'ı açılan journal); zamanlama görünümü. Arayüzden run iptal edilir, sinyal gönderilir, etiket eklenip silinir, zamanlama duraklatılır/silinir; sayfa iki saniyede bir kendini yeniler.
+Sıfır bağımlılıklı, standart kütüphaneyle yazılmış bir web arayüzü: durum sayaçları ve durum/workflow/etiket/ebeveyn süzgeçli run listesi; run ayrıntısı (kayıt, etiketler, girdi/çıktı, kira, çocuklar, sinyaller ve tıklayınca payload'ı açılan journal); zamanlama görünümü. Arayüzden run iptal edilir, sinyal gönderilir, etiket eklenip silinir, run bir op'a geri sarılır (journal satırındaki ⟲ düğmesi ya da başlıktaki *Reset run*) ve zamanlama duraklatılır/silinir; sayfa iki saniyede bir kendini yeniler.
 
 Bir worker'ın içine de gömülebilir — o zaman işlemler o worker üzerinden, süreç içinde yürür:
 
@@ -278,11 +278,50 @@ server = await start_ui(rt, port=8787)      # rt yerine çıplak bir store da ve
 await server.aclose()
 ```
 
-Arkasındaki JSON API (`/api/summary`, `/api/runs?status=&workflow=&tag=k=v`, `/api/runs/<id>`, `/api/runs/<id>/cancel|signal|tags`, `/api/schedules`, …) kendi araçlarınızdan da kullanılabilir; yol parçaları yüzde-kodlanır (`#` içeren run id'leri gibi). Kimlik doğrulama **yoktur**: varsayılan olarak yalnız localhost'a bağlanır; dışarı açacaksanız önüne kimlik doğrulayan bir proxy koyun. Kodu yüklü olmayan bir süreçten (`python -m sicim ui`) gönderilen sinyal ve iptal store'a yazılır, run'ı süren worker uygular.
+Arkasındaki JSON API (`/api/summary`, `/api/runs?status=&workflow=&tag=k=v`, `/api/runs/<id>`, `/api/runs/<id>/cancel|reset|signal|tags`, `/api/schedules`, …) kendi araçlarınızdan da kullanılabilir; yol parçaları yüzde-kodlanır (`#` içeren run id'leri gibi). Kimlik doğrulama **yoktur**: varsayılan olarak yalnız localhost'a bağlanır; dışarı açacaksanız önüne kimlik doğrulayan bir proxy koyun. Kodu yüklü olmayan bir süreçten (`python -m sicim ui`) gönderilen sinyal ve iptal store'a yazılır, run'ı süren worker uygular.
 
 ### İptal
 
 `rt.cancel(run_id)` **kooperatiftir**: run bir sonraki *canlı* operasyon sınırında durur (asla replay'in veya bir adımın ortasında değil), telafilerini koşar ve `CANCELLED` biter. Uçuştaki bir adımın bitmesi beklenir — sınırlamak için adım `timeout=`'u kullanın.
+
+### Reset: bir op'tan yeniden oynatma
+
+```python
+await rt.reset("arge-1")                 # ilk başarısız op'a geri sar ve oradan devam et
+await rt.reset("arge-1", to_op=7)        # 7. op'tan itibaren yeniden oynat
+await rt.reset("arge-1", to_op=0)        # run'ı baştan
+await rt.reset("arge-1", resume=False)   # yalnız geri sar; sürmeyi devralacak worker'a bırak
+```
+
+`reset`, journal'ın seçilen op'tan itibaren olan kısmını siler ve run'ı yeniden sürer: o op ve
+sonrası **canlı** çalışır, öncesi journal'dan replay edilir (yeniden çalıştırılmaz). LLM'in bozuk
+cevap verdiği adımı — ya da bu arada düzelttiğiniz bir hatayı — baştan başlamadan yeniden
+denemenin yolu budur. `to_op` verilmezse ilk başarısız operasyona, hiç yoksa 0'a sarılır.
+
+Her durumdaki run resetlenebilir: biten bir run yeniden açılır (durum `RUNNING`, sonuç ve hata
+temizlenir) ve `resume=True` (varsayılan) ile hemen burada sürülür. Run'ı **başka** bir worker
+sürüyorsa kirası alınamaz ve `LeaseUnavailable` fırlar; *bu* worker sürüyorsa sürücü önce
+çökme-eşdeğeri durdurulur — eski `RunHandle` böylece emekliye ayrılır (beklemek `CancelledError`
+verir), run'ı `reset()`'in döndürdüğü handle'dan (ya da `resume()`'dan) izleyin. Reset reddedilirse
+durdurulan sürücü geri başlatılır: run bulunduğu hâlde bırakılır.
+
+**Journal geri sarılır, dünya sarılmaz.** `to_op`'tan önceki adımlar tamamlanmış sayılır ve yan
+etkileri yerinde kalır. İki sonucu vardır:
+
+- Silinen op'larda başlatılmış **çocuk run'lar** (ve onların altındaki ağaç) silinir ki replay
+  onları sıfırdan başlatsın; kiraları ebeveynin kirası gibi alınır.
+- **Telafi kayıtları** da silinir, böylece geri sarılan run telafi yığınını yeniden kurar ve
+  gerekirse yeniden telafi edebilir. Telafiler zaten koşmuşsa etkileri geri getirilmez ve onların
+  geri aldığı adımlar journal'dan "yapılmış" gibi replay edilir; bu belirsizlik yüzünden o durumda
+  `force=True` istenir.
+
+Silinen `wait_event` op'larının tükettiği **sinyaller kutuya geri döner** ve replay'de yeniden
+tüketilirler. Geri sarmanın kendisi `run_reset` olayı olarak journal'lanır ve sonraki resetlerde
+de korunur — denetim izi olarak kalır.
+
+Workflow kodu yüklü olmayan bir süreçten (CLI, izleme arayüzü) resetlenen run `RUNNING` bırakılır;
+kodu olan worker `recover()` ile devralır. Bir çocuk run'ı tek başına resetlemek ebeveynin
+journal'ındaki `child_completed` sonucunu değiştirmez — ağacı ebeveyninden resetleyin.
 
 ### Çökme modeli
 
@@ -307,6 +346,7 @@ Workflow **gövdesi** için (adımlar için değil):
 | `rt.recover()` / `rt.resume(run_id)` | Yarım run'ları replay edip devam ettirir (kiralılar: atla / `LeaseUnavailable`) |
 | `rt.signal(run_id, name, payload)` | Olay teslim eder (gerekirse run'ı uyandırır; worker'lar arası çalışır) |
 | `rt.cancel(run_id)` | Kooperatif iptal + telafiler (worker'lar arası çalışır) |
+| `rt.reset(run_id, to_op=, resume=, force=)` | Journal'ı bir op'a geri sarar ve run'ı yeniden sürer |
 | `rt.status(run_id)` / `rt.events(run_id)` | Run kaydı / journal |
 | `rt.list_runs(status, workflow=, tags=, parent_run_id=, limit=, newest_first=)` | Run arama (tüm süzgeçler AND) |
 | `rt.tag(run_id, {k: v, eski: None})` | Etiket ekler/değiştirir/siler (her durumda; zinciri takip eder) |
@@ -327,13 +367,14 @@ python -m sicim --db sicim.db list --status running --workflow order_flow --tag 
 python -m sicim --db sicim.db list --limit 20                  # en yeni 20 run
 python -m sicim --db sicim.db show <run_id>                    # run kaydı + etiketler + journal + sinyaller
 python -m sicim --db sicim.db tag <run_id> stage=review --remove env
+python -m sicim --db sicim.db reset <run_id> [--to-op 7] [--force]   # geri sar; worker devralır
 python -m sicim --db sicim.db prune --older-than-days 30 --dry-run
 python -m sicim --db sicim.db schedule list
 python -m sicim --db sicim.db schedule pause|resume|delete <schedule_id>
 python -m sicim --db sicim.db ui --port 8787                   # web izleme arayüzü (Ctrl-C ile durur)
 ```
 
-`list`, `--status`, `--workflow` ve tekrarlanabilir `--tag k=v` süzgeçlerinin hepsini birlikte uygular; `--limit N` en yeni N run'ı gösterir. `prune`, verilen eşikten eski terminal run'ları (journal'larıyla birlikte) siler; `RUNNING` ve insan müdahalesi bekleyen `COMPENSATION_FAILED` run'lara asla dokunmaz. Tüm komutlar `--db` yerine `--pg DSN` ile PostgreSQL'e karşı da çalışır.
+`list`, `--status`, `--workflow` ve tekrarlanabilir `--tag k=v` süzgeçlerinin hepsini birlikte uygular; `--limit N` en yeni N run'ı gösterir. `reset` journal'ı geri sarar ve run'ı `RUNNING` bırakır: CLI'da workflow kodu olmadığı için sürmeyi, kodu olan worker `recover()` ile devralır. `prune`, verilen eşikten eski terminal run'ları (journal'larıyla birlikte) siler; `RUNNING` ve insan müdahalesi bekleyen `COMPENSATION_FAILED` run'lara asla dokunmaz. Tüm komutlar `--db` yerine `--pg DSN` ile PostgreSQL'e karşı da çalışır.
 
 ## Örnekler ve test
 
@@ -341,11 +382,12 @@ python -m sicim --db sicim.db ui --port 8787                   # web izleme aray
 .venv/bin/python examples/order_saga.py       # saga + telafi + çökmeden devam
 .venv/bin/python examples/agent_research.py   # LLM agent: paralel araçlar, insan onayı, çökme
 .venv/bin/python examples/scheduled_agent.py  # aralıkla tetiklenen agent, çakışan tick'ler atlanır
+.venv/bin/python examples/reset_agent.py      # bozuk LLM adımını reset ile yeniden oynatma
 .venv/bin/python examples/monitor_ui.py       # örnek run'lar + zamanlama ile web izleme arayüzü (Ctrl-C)
 .venv/bin/pytest -q                           # tüm senaryolar üç backend'de de koşar
 ```
 
-## v0.6 kısıtları ve yol haritası
+## v0.7 kısıtları ve yol haritası
 
 - Sinyal, var olmayan run'a gönderilemez (önce `start`).
 - Lease devralma TTL çözünürlüğündedir: ölen worker'ın run'ı en fazla `lease_ttl` sonra devralınır.
@@ -357,4 +399,7 @@ python -m sicim --db sicim.db ui --port 8787                   # web izleme aray
 - İzleme arayüzünde kimlik doğrulama yoktur (yalnız localhost'a bağlayın ya da proxy arkasına alın); sayfa poll ile yenilenir, canlı akış yoktur.
 - Zamanlama çözünürlüğü `schedule_poll_interval`'dır (saniyeli cron için onu da küçültün); DST geçişlerinde var olmayan/yinelenen duvar saatleri bir sonraki geçerli ana kayar. Adlandırılmış saat dilimleri (`tz=`) sistem tz veritabanını (yoksa `tzdata` paketini) ister; UTC için gerekmez.
 - `overlap="skip"` çoklu worker'da en-iyi-çabadır: "önceki run bitti mi" kontrolü ile başlatma arasındaki dar yarışta nadiren bir fazla run başlayabilir. Aynı tick'in iki kez başlaması ise deterministik id sayesinde imkânsızdır.
-- Yol haritası: arayüzde canlı akış (SSE) ve run zaman çizelgesi, büyük adım sonuçları için harici blob depolama, workflow sorgu işleyicileri (`ctx.query`), run'ı belirli bir op'tan yeniden oynatma (reset).
+- `reset` journal'ı geri sarar, yan etkileri değil: `to_op`'tan önceki adımlar yapılmış sayılır. Telafileri koşmuş bir run'da `force=True` ister ve silinen op'ların çocuk run'larını (ağacıyla) siler.
+- Bir continue-as-new halkası tek başına resetlenemez (ardılını öksüz bırakırdı); zincirin canlı ucunu resetleyin.
+- Özel `Store` uygulamaları: v0.7 ile `replace_events` eklendi ve `mark_signal_consumed` bir `consumed` parametresi aldı (paketle gelen üç backend güncel).
+- Yol haritası: arayüzde canlı akış (SSE) ve run zaman çizelgesi, büyük adım sonuçları için harici blob depolama, workflow sorgu işleyicileri (`ctx.query`), resetlenen run'ın girdilerini/argümanlarını da değiştirebilme.

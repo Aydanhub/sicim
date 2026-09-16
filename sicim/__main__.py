@@ -4,6 +4,7 @@ Usage:
     python -m sicim --db sicim.db list [--status running] [--workflow NAME] [--tag k=v ...] [--limit N]
     python -m sicim --db sicim.db show RUN_ID
     python -m sicim --db sicim.db tag RUN_ID k=v [k2=v2 ...] [--remove k3 ...]
+    python -m sicim --db sicim.db reset RUN_ID [--to-op N] [--force]
     python -m sicim --db sicim.db prune --older-than-days 30 [--dry-run]
     python -m sicim --db sicim.db schedule list
     python -m sicim --db sicim.db schedule pause|resume|delete SCHEDULE_ID
@@ -21,6 +22,7 @@ import sys
 import time
 
 from .errors import SicimError
+from .journal import Kind
 from .runtime import Runtime
 from .store import RunStatus, SQLiteStore, Store
 
@@ -121,6 +123,27 @@ async def _tag(store: Store, args: argparse.Namespace) -> None:
     print(f"tags:     {_fmt_tags(tags) or '(none)'}")
 
 
+async def _reset(store: Store, args: argparse.Namespace) -> None:
+    rt = Runtime(store, scheduler=False)
+    try:
+        # resume=False: this process has no workflow code, so the rewound run
+        # is left RUNNING for the worker that recovers it.
+        await rt.reset(args.run_id, to_op=args.to_op, resume=False, force=args.force)
+    except (SicimError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from None
+    record = await store.load_run(args.run_id)
+    events = await store.load_events(args.run_id)
+    marker = next((e for e in reversed(events) if e.kind == Kind.RUN_RESET), None)
+    to_op = marker.payload["to_op"] if marker else args.to_op
+    print(
+        f"run '{args.run_id}' rewound to op {to_op} "
+        f"({marker.payload['dropped'] if marker else 0} event(s) dropped); "
+        f"status is now {record.status.value}"
+    )
+    print("a worker with the workflow code picks it up on its next recover()")
+
+
 async def _ui(store: Store, args: argparse.Namespace) -> None:
     from .ui import start_ui
 
@@ -189,6 +212,8 @@ async def _amain(args: argparse.Namespace) -> None:
             await _schedule(store, args)
         elif args.command == "tag":
             await _tag(store, args)
+        elif args.command == "reset":
+            await _reset(store, args)
         elif args.command == "ui":
             await _ui(store, args)
         else:
@@ -218,6 +243,18 @@ def main(argv: list[str] | None = None) -> None:
     p_tag.add_argument("run_id")
     p_tag.add_argument("tags", nargs="*", type=_parse_tag, metavar="KEY=VALUE", help="tags to set")
     p_tag.add_argument("--remove", action="append", default=[], metavar="KEY", help="tag key to remove (repeatable)")
+    p_reset = sub.add_parser(
+        "reset", help="rewind a run's journal to an operation and leave it for a worker to replay"
+    )
+    p_reset.add_argument("run_id")
+    p_reset.add_argument(
+        "--to-op", type=int, default=None, metavar="N",
+        help="operation to rewind to (default: the first failed one, else 0 = full re-run)",
+    )
+    p_reset.add_argument(
+        "--force", action="store_true",
+        help="reset even though compensations already ran (their effects are not re-applied)",
+    )
     p_ui = sub.add_parser("ui", help="serve the web monitoring UI until Ctrl-C")
     p_ui.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     p_ui.add_argument("--port", type=int, default=8787, help="port (0 picks a free one)")

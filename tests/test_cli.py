@@ -52,6 +52,22 @@ def test_list_filters_by_tag_workflow_and_limit(tmp_path, capsys):
     assert "(no runs)" in capsys.readouterr().out
 
 
+def test_reset_rewinds_a_run_for_a_worker(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    seed(db)
+
+    main(["--db", db, "reset", "cli-a", "--to-op", "0"])
+    out = capsys.readouterr().out
+    assert "rewound to op 0" in out
+    assert "status is now running" in out
+
+    main(["--db", db, "list", "--status", "running"])
+    assert "cli-a" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        main(["--db", db, "reset", "nope"])
+
+
 def test_show_prints_tags(tmp_path, capsys):
     db = str(tmp_path / "cli.db")
     seed(db)

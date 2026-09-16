@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import re
 import datetime as dt
@@ -52,6 +53,24 @@ from .workflow import WorkflowFn, get_workflow, workflow_name, workflow_version
 logger = logging.getLogger("sicim")
 
 _CHAIN_RE = re.compile(r"^(?P<base>.*)#(?P<n>\d+)$")
+
+#: Run-level markers a reset always drops: the run is being re-opened.
+_TERMINAL_RUN_KINDS = frozenset(
+    {Kind.RUN_COMPLETED, Kind.RUN_FAILED, Kind.RUN_CANCELLED, Kind.RUN_CONTINUED}
+)
+#: Compensation outcomes a reset always drops, whatever op they belong to, so
+#: the rewound run rebuilds its compensation stack and can compensate again.
+_COMP_OUTCOME_KINDS = frozenset({Kind.COMP_ATTEMPT_FAILED, Kind.COMP_COMPLETED, Kind.COMP_FAILED})
+#: Where ``reset()`` rewinds to when no op is given: the first failed operation.
+_FAILURE_KINDS = frozenset({Kind.STEP_FAILED, Kind.CHILD_FAILED, Kind.WAIT_TIMED_OUT})
+
+
+def _compensated_reset_error(run_id: str) -> SicimError:
+    return SicimError(
+        f"run '{run_id}' already ran compensations: replaying the steps they undid would use "
+        "journaled results for effects that no longer exist. Pass force=True to reset anyway "
+        "(and re-apply those effects yourself)."
+    )
 
 
 def _next_chain_id(run_id: str) -> str:
@@ -379,6 +398,160 @@ class Runtime:
                 self._cancel_events.pop(run_id, None)
         self._wake(run_id)
 
+    async def reset(
+        self,
+        run_id: str,
+        *,
+        to_op: int | None = None,
+        resume: bool = True,
+        force: bool = False,
+    ) -> RunHandle:
+        """Rewind a run to just before operation ``to_op`` and drive it again.
+
+        Everything the journal recorded at ``to_op`` and later is dropped, so
+        replay re-executes those operations *live* — this is how a run that
+        failed on a bad LLM answer (or against a bug you have since fixed) is
+        retried from the failing step instead of from the beginning. Operations
+        before ``to_op`` keep their recorded outcomes and are not re-executed.
+        ``to_op=None`` (the default) rewinds to the first failed operation, or
+        to 0 — a full re-run — if nothing failed.
+
+        Resettable at any status: a terminal run is re-opened (status back to
+        RUNNING, result/error cleared) and, with ``resume=True``, driven here
+        right away. The run must not be driven by another worker (its lease is
+        claimed here, otherwise :class:`LeaseUnavailable`); a driver *this*
+        worker owns is stopped crash-equivalently first.
+
+        Rewinding the journal does not rewind the world — completed steps
+        before ``to_op`` stay done and their side effects stay applied. Two
+        consequences:
+
+        * Child runs scheduled at dropped ops are deleted (with their own
+          descendants) so replay starts them fresh; their leases are claimed
+          the same way the parent's is.
+        * Compensation outcomes are dropped too, so the rewound run rebuilds
+          its compensation stack. If compensations had already run, their
+          side effects are *not* re-applied and the steps they undid are
+          replayed from the journal as if still done — that ambiguity is why
+          the reset then requires ``force=True``.
+
+        Signals consumed by dropped ``wait_event`` ops return to the inbox, so
+        the replayed wait consumes them again. The rewind itself is journaled
+        (``run_reset``) and survives further resets as an audit trail.
+
+        Stopping the old driver retires the :class:`RunHandle` that started it
+        (awaiting it raises ``CancelledError``); use the handle this method
+        returns, or :meth:`resume`, to follow the run from here.
+        """
+        if to_op is not None and to_op < 0:
+            raise ValueError("to_op must be >= 0")
+        record = await self._load(run_id)
+        if record.status is RunStatus.CONTINUED:
+            raise SicimError(
+                f"run '{run_id}' ended by continuing as '{record.continued_to}'; reset the live "
+                "end of the chain (or that successor) instead — rewinding a link would orphan it"
+            )
+        stopped = await self._stop_local_driver(run_id)
+        if not await self.store.try_acquire_lease(run_id, self.worker_id, self.lease_ttl):
+            lease = await self.store.load_lease(run_id)
+            raise LeaseUnavailable(run_id, lease[0] if lease else None)
+
+        claimed: list[str] = []
+        try:
+            events = await self.store.load_events(run_id)
+            if to_op is None:
+                to_op = next(
+                    (e.op_id for e in events if e.kind in _FAILURE_KINDS and e.op_id >= 0), 0
+                )
+            kept, dropped = [], []
+            for event in events:
+                stale = (
+                    event.op_id >= to_op
+                    or event.kind in _TERMINAL_RUN_KINDS
+                    or event.kind in _COMP_OUTCOME_KINDS
+                )
+                (dropped if stale else kept).append(event)
+            if not force and any(e.kind == Kind.COMP_COMPLETED for e in dropped):
+                raise _compensated_reset_error(run_id)
+
+            # Claim everything that will be deleted *before* touching the
+            # journal, so a lease we cannot get leaves the run untouched.
+            for event in dropped:
+                if event.kind == Kind.CHILD_SCHEDULED:
+                    child_run_id = event.payload["child_run_id"]
+                    if child_run_id != run_id:  # defensive: never delete ourselves
+                        claimed.extend(await self._claim_run_tree(child_run_id))
+
+            renumbered = [dataclasses.replace(e, seq=i) for i, e in enumerate(kept)]
+            await self.store.replace_events(run_id, renumbered)
+            marker = Event(
+                seq=len(renumbered),
+                kind=Kind.RUN_RESET,
+                op_id=-1,
+                payload={
+                    "to_op": to_op,
+                    "dropped": len(dropped),
+                    "from_status": record.status.value,
+                    "worker": self.worker_id,
+                },
+                ts=time.time(),
+            )
+            await self.store.append_event(run_id, marker)
+            for event in dropped:
+                if event.kind == Kind.EVENT_CONSUMED:
+                    seq = event.payload.get("signal_seq")
+                    if seq is not None:
+                        await self.store.mark_signal_consumed(run_id, int(seq), False)
+            await self.store.update_run(
+                run_id,
+                status=RunStatus.RUNNING,
+                result=None,
+                error=None,
+                cancel_requested=False,
+                continued_to=None,
+            )
+            for victim in claimed:
+                await self.store.delete_run(victim)
+            self._cancel_flags.pop(run_id, None)
+            self._cancel_events.pop(run_id, None)
+            logger.info(
+                "[%s] reset to op %d (%d event(s) dropped, %d child run(s) deleted)",
+                run_id, to_op, len(dropped), len(claimed),
+            )
+            if self.on_event is not None:
+                try:
+                    self.on_event(run_id, marker)
+                except Exception:  # noqa: BLE001 - observers must never break a reset
+                    logger.exception("on_event observer raised for run '%s'", run_id)
+        except BaseException:
+            for victim in claimed:
+                with contextlib.suppress(Exception):
+                    await self.store.release_lease(victim, self.worker_id)
+            # A refused reset must leave the run as it found it: if we stopped
+            # our own driver for it, put it back to work.
+            if stopped:
+                with contextlib.suppress(Exception):
+                    await self._ensure(await self._load(run_id))
+            else:
+                with contextlib.suppress(Exception):
+                    await self.store.release_lease(run_id, self.worker_id)
+            raise
+
+        record = await self._load(run_id)
+        if resume:
+            try:
+                return await self._ensure(record)
+            except WorkflowNotFound:
+                # No code for it here (a UI or CLI process): the rewound run is
+                # left RUNNING for a worker that has the workflow to recover.
+                logger.info(
+                    "[%s] reset; workflow '%s' is not registered in this process, leaving it "
+                    "for a worker that has the code",
+                    run_id, record.workflow,
+                )
+        await self.store.release_lease(run_id, self.worker_id)
+        return RunHandle(run_id, record=record, runtime=self)
+
     async def status(self, run_id: str) -> RunRecord:
         return await self._load(run_id)
 
@@ -604,6 +777,44 @@ class Runtime:
                 child_id = pred_id
         except Exception:
             logger.exception("chain pruning behind '%s' failed; continuing", tail_id)
+
+    async def _stop_local_driver(self, run_id: str) -> bool:
+        """Stop a driver task this worker owns, crash-equivalently; returns
+        whether there was one.
+
+        Used by :meth:`reset`: the run must stand still while its journal is
+        rewritten. Cancelling clears the cancel flag first so the driver does
+        *not* take the cooperative-cancellation path (compensations); it exits
+        the way it would in a crash, writing nothing.
+        """
+        handle = self._handles.get(run_id)
+        if handle is None or handle._task is None or handle._task.done():
+            return False
+        self._cancel_flags[run_id] = False
+        handle._task.cancel()
+        with contextlib.suppress(BaseException):
+            await handle._task
+        self._handles.pop(run_id, None)
+        return True
+
+    async def _claim_run_tree(self, run_id: str) -> list[str]:
+        """Claim the leases of a run and its descendants, returning their ids.
+
+        Raises :class:`LeaseUnavailable` if any of them is driven elsewhere;
+        the caller releases whatever was claimed before that.
+        """
+        record = await self.store.load_run(run_id)
+        if record is None:
+            return []
+        await self._stop_local_driver(run_id)
+        if not await self.store.try_acquire_lease(run_id, self.worker_id, self.lease_ttl):
+            lease = await self.store.load_lease(run_id)
+            raise LeaseUnavailable(run_id, lease[0] if lease else None)
+        claimed = [run_id]
+        for child in await self.store.list_runs(parent_run_id=run_id):
+            if child.run_id != run_id:
+                claimed.extend(await self._claim_run_tree(child.run_id))
+        return claimed
 
     async def _await_remote(self, run_id: str) -> Any:
         """Outcome of a run driven by *another* worker: poll the store until the

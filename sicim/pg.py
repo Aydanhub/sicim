@@ -438,6 +438,26 @@ class PostgresStore(Store):
             for r in rows
         ]
 
+    async def replace_events(self, run_id: str, events: list[Event]) -> None:
+        rows = [
+            (run_id, e.seq, e.kind, e.op_id, serde.encode(e.payload), e.ts) for e in events
+        ]
+
+        async def op(conn):
+            # The old journal disappears and the rewound one lands together:
+            # a crash mid-reset must never leave a half-truncated run.
+            async with conn.transaction():
+                await conn.execute("DELETE FROM events WHERE run_id = %s", (run_id,))
+                if rows:
+                    async with conn.cursor() as cursor:
+                        await cursor.executemany(
+                            "INSERT INTO events (run_id, seq, kind, op_id, payload, ts)"
+                            " VALUES (%s,%s,%s,%s,%s,%s)",
+                            rows,
+                        )
+
+        await self._with_conn(op)
+
     # -- signals -------------------------------------------------------------
 
     async def append_signal(self, run_id: str, name: str, payload: Any) -> int:
@@ -485,10 +505,11 @@ class PostgresStore(Store):
             for r in rows
         ]
 
-    async def mark_signal_consumed(self, run_id: str, seq: int) -> None:
+    async def mark_signal_consumed(self, run_id: str, seq: int, consumed: bool = True) -> None:
         async def op(conn):
             await conn.execute(
-                "UPDATE signals SET consumed = 1 WHERE run_id = %s AND seq = %s", (run_id, seq)
+                "UPDATE signals SET consumed = %s WHERE run_id = %s AND seq = %s",
+                (int(consumed), run_id, seq),
             )
 
         await self._with_conn(op)

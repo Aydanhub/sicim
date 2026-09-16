@@ -1,5 +1,6 @@
 """Store behaviour: durability, deletion, migrations, PostgreSQL reconnect."""
 
+import dataclasses
 import sqlite3
 
 import pytest
@@ -74,6 +75,36 @@ async def test_delete_run_history_keeps_the_record(store):
     assert (await store.load_run("H1")) is not None
     assert await store.load_events("H1") == []
     assert await store.load_signals("H1") == []
+
+
+async def test_replace_events_rewrites_the_journal(store):
+    await store.create_run(RunRecord(run_id="ev", workflow="wf"))
+    for seq in range(4):
+        await store.append_event(
+            "ev", Event(seq=seq, kind="step_completed", op_id=seq, payload={"i": seq}, ts=100.0 + seq)
+        )
+    assert [e.seq for e in await store.load_events("ev")] == [0, 1, 2, 3]
+
+    kept = [e for e in await store.load_events("ev") if e.op_id < 2]
+    await store.replace_events(
+        "ev", [dataclasses.replace(e, seq=i) for i, e in enumerate(kept)]
+    )
+    events = await store.load_events("ev")
+    assert [(e.seq, e.op_id) for e in events] == [(0, 0), (1, 1)]
+    assert events[0].payload == {"i": 0}
+
+    await store.replace_events("ev", [])
+    assert await store.load_events("ev") == []
+
+
+async def test_signals_can_be_marked_unconsumed_again(store):
+    await store.create_run(RunRecord(run_id="sig", workflow="wf"))
+    seq = await store.append_signal("sig", "go", {"n": 1})
+    await store.mark_signal_consumed("sig", seq)
+    assert [s.consumed for s in await store.load_signals("sig")] == [True]
+    await store.mark_signal_consumed("sig", seq, False)
+    [signal] = await store.load_signals("sig")
+    assert signal.consumed is False and signal.payload == {"n": 1}
 
 
 async def test_parent_run_id_roundtrips(store):

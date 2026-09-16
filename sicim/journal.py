@@ -37,6 +37,9 @@ class Kind:
     RUN_FAILED = "run_failed"
     RUN_CANCELLED = "run_cancelled"
     RUN_CONTINUED = "run_continued"
+    #: An operator rewound the journal (``Runtime.reset``); kept as an audit
+    #: trail across the truncation and ignored by replay.
+    RUN_RESET = "run_reset"
 
     # Step lifecycle
     STEP_SCHEDULED = "step_scheduled"

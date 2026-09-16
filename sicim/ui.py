@@ -12,8 +12,8 @@ or embedded in a worker, where actions go through that worker in-process:
 
 The page lists runs (filterable by status, workflow, tags and parent), shows a
 run's record, tags, journal, signals, lease and children, lets you cancel a
-run, send it a signal and edit its tags, and manages schedules. It refreshes
-itself every two seconds.
+run, send it a signal, edit its tags and rewind it to an operation (reset), and
+manages schedules. It refreshes itself every two seconds.
 
 The JSON API behind it (every response is ``application/json``; errors carry
 ``{"error": message}``):
@@ -22,6 +22,7 @@ The JSON API behind it (every response is ``application/json``; errors carry
     GET    /api/runs?status=&workflow=&tag=k=v&parent=&limit=&order=oldest
     GET    /api/runs/{run_id}              record, events, signals, lease, children
     POST   /api/runs/{run_id}/cancel
+    POST   /api/runs/{run_id}/reset        {"to_op": 3, "force": false}
     POST   /api/runs/{run_id}/signal       {"name": "approval", "payload": …}
     POST   /api/runs/{run_id}/tags         {"tags": {"k": "v", "old": null}}
     GET    /api/schedules
@@ -165,6 +166,7 @@ class UIServer:
             ("GET", re.compile(r"/api/runs"), self._runs),
             ("GET", re.compile(r"/api/runs/(?P<run_id>[^/]+)"), self._run),
             ("POST", re.compile(r"/api/runs/(?P<run_id>[^/]+)/cancel"), self._cancel),
+            ("POST", re.compile(r"/api/runs/(?P<run_id>[^/]+)/reset"), self._reset),
             ("POST", re.compile(r"/api/runs/(?P<run_id>[^/]+)/signal"), self._signal),
             ("POST", re.compile(r"/api/runs/(?P<run_id>[^/]+)/tags"), self._tags),
             ("GET", re.compile(r"/api/schedules"), self._schedules),
@@ -334,6 +336,14 @@ class UIServer:
 
     async def _cancel(self, request: Request, run_id: str) -> Response:
         await self.runtime.cancel(run_id)
+        return _json({"run": _run_json(await self.runtime.status(run_id))})
+
+    async def _reset(self, request: Request, run_id: str) -> Response:
+        body = request.json_object()
+        to_op = body.get("to_op")
+        if to_op is not None and (not isinstance(to_op, int) or isinstance(to_op, bool) or to_op < 0):
+            raise HTTPError(400, "'to_op' must be an integer >= 0 (or null for the failed op)")
+        await self.runtime.reset(run_id, to_op=to_op, force=bool(body.get("force")))
         return _json({"run": _run_json(await self.runtime.status(run_id))})
 
     async def _signal(self, request: Request, run_id: str) -> Response:
