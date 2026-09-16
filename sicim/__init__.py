@@ -35,7 +35,7 @@ from .store import (
 )
 from .workflow import get_workflow, workflow
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "ChildFailed",

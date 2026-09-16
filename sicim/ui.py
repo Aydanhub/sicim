@@ -13,12 +13,14 @@ or embedded in a worker, where actions go through that worker in-process:
 The page lists runs (filterable by status, workflow, tags and parent), shows a
 run's record, tags, journal, signals, lease and children, lets you cancel a
 run, send it a signal, edit its tags and rewind it to an operation (reset), and
-manages schedules. It refreshes itself every two seconds.
+manages schedules. It follows a live event stream (SSE) and falls back to
+polling when the stream is unavailable.
 
 The JSON API behind it (every response is ``application/json``; errors carry
 ``{"error": message}``):
 
     GET    /api/summary                    run counts per status, workflow names
+    GET    /api/stream[?run=<run_id>]      live change notifications (text/event-stream)
     GET    /api/runs?status=&workflow=&tag=k=v&parent=&limit=&order=oldest
     GET    /api/runs/{run_id}              record, events, signals, lease, children
     POST   /api/runs/{run_id}/cancel
@@ -28,6 +30,14 @@ The JSON API behind it (every response is ``application/json``; errors carry
     GET    /api/schedules
     POST   /api/schedules/{id}/pause  |  /resume
     DELETE /api/schedules/{id}
+
+``/api/stream`` is a Server-Sent Events channel: each message carries a JSON
+*array* of change notifications (``{"kind": ..., "run_id": ...}``) telling the
+client what to re-fetch — it never carries run data itself. Changes made by
+this process (journal appends of runs a co-hosted worker drives) are pushed the
+instant they happen; changes made by *other* processes are picked up by a store
+poll every ``stream_poll_interval`` seconds. Idle streams emit a ``: keepalive``
+comment.
 
 Path segments are percent-encoded (run ids may contain ``#``, ``/``, ``@``).
 There is no authentication: bind to localhost (the default) or put the server
@@ -46,11 +56,12 @@ import logging
 import re
 import time
 from importlib import resources
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .errors import RunNotFound, ScheduleNotFound, SicimError
+from .journal import Event, Kind
 from .runtime import Runtime
 from .store import RunRecord, RunStatus, ScheduleRecord, Store
 
@@ -66,7 +77,28 @@ _REASONS = {
     409: "Conflict",
     413: "Payload Too Large",
     500: "Internal Server Error",
+    503: "Service Unavailable",
 }
+#: How many pending notifications one live stream buffers. A client too slow
+#: to keep up loses the overflow, which costs nothing: every notification only
+#: says "re-fetch", and the next one it does read brings it up to date.
+_STREAM_QUEUE = 256
+#: Newest runs the change poll compares each tick.
+_POLL_RUNS = 200
+#: Notifications that reach *every* stream, including one watching a single
+#: run: they move the status counters the whole page shows.
+_GLOBAL_KINDS = frozenset(
+    {
+        Kind.RUN_STARTED,
+        Kind.RUN_COMPLETED,
+        Kind.RUN_FAILED,
+        Kind.RUN_CANCELLED,
+        Kind.RUN_CONTINUED,
+        Kind.RUN_RESET,
+        "run_changed",
+        "schedules",
+    }
+)
 
 
 class HTTPError(Exception):
@@ -104,6 +136,38 @@ class Response:
     body: bytes
     content_type: str = "application/json; charset=utf-8"
     status: int = 200
+
+
+@dataclasses.dataclass
+class StreamResponse:
+    """A long-lived response: headers, then chunks until the client leaves."""
+
+    chunks: AsyncIterator[bytes]
+    content_type: str = "text/event-stream; charset=utf-8"
+    status: int = 200
+    on_close: Callable[[], None] = lambda: None
+
+
+@dataclasses.dataclass(eq=False)  # identity: subscribers live in a set
+class _Subscriber:
+    """One open live stream: its pending notifications and what it watches."""
+
+    queue: asyncio.Queue
+    run_id: str | None = None
+    dropped: int = 0
+
+    def wants(self, notification: dict[str, Any]) -> bool:
+        if self.run_id is None:
+            return True
+        return (
+            notification.get("run_id") == self.run_id
+            or notification.get("kind") in _GLOBAL_KINDS
+        )
+
+
+def _sse_data(notifications: list[dict[str, Any]]) -> bytes:
+    """One SSE message carrying a JSON array of change notifications."""
+    return f"data: {json.dumps(notifications, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 def _json(data: Any, status: int = 200) -> Response:
@@ -151,11 +215,32 @@ async def _read_request(reader: asyncio.StreamReader) -> Request:
 class UIServer:
     """The HTTP server behind :func:`start_ui`; ``url`` is where it listens."""
 
-    def __init__(self, runtime: Runtime, *, owns_runtime: bool = False):
+    def __init__(
+        self,
+        runtime: Runtime,
+        *,
+        owns_runtime: bool = False,
+        stream_poll_interval: float | None = 1.0,
+        heartbeat: float = 20.0,
+        max_streams: int = 32,
+    ):
+        if stream_poll_interval is not None and stream_poll_interval <= 0:
+            raise ValueError("stream_poll_interval must be None or > 0")
         self.runtime = runtime
         self._owns_runtime = owns_runtime
+        self.stream_poll_interval = stream_poll_interval
+        self.heartbeat = heartbeat
+        self.max_streams = max_streams
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[asyncio.Task] = set()
+        self._subscribers: set[_Subscriber] = set()
+        self._poll_task: asyncio.Task | None = None
+        self._unobserve: Callable[[], None] | None = None
+        # None until the snapshot taken when the server starts listening: a
+        # stream is told about changes from then on, never about the past.
+        self._seen_runs: dict[str, tuple[str, float]] | None = None
+        self._seen_seqs: dict[str, int] = {}
+        self._seen_schedules: list | None = None
         self._page = resources.files(__package__).joinpath("ui.html").read_bytes()
         self.host = "127.0.0.1"
         self.port = 0
@@ -163,6 +248,7 @@ class UIServer:
         self._routes: list[tuple[str, re.Pattern[str], Handler]] = [
             ("GET", re.compile(r"/"), self._page_handler),
             ("GET", re.compile(r"/api/summary"), self._summary),
+            ("GET", re.compile(r"/api/stream"), self._stream),
             ("GET", re.compile(r"/api/runs"), self._runs),
             ("GET", re.compile(r"/api/runs/(?P<run_id>[^/]+)"), self._run),
             ("POST", re.compile(r"/api/runs/(?P<run_id>[^/]+)/cancel"), self._cancel),
@@ -184,10 +270,30 @@ class UIServer:
         self._server = await asyncio.start_server(self._connection, host, port)
         name = self._server.sockets[0].getsockname()
         self.host, self.port = name[0], name[1]
+        # Runs driven in this process push their journal events straight to the
+        # open streams; everything else is noticed by the change poll.
+        self._unobserve = self.runtime.add_observer(self._on_journal_event)
+        if self.stream_poll_interval is not None:
+            # Snapshot the store now, not on the first tick: whatever changes
+            # after the server is up is then a change someone can be told about.
+            try:
+                await self._poll_once()
+            except Exception:  # noqa: BLE001 - a store hiccup must not stop the UI
+                logger.exception("initial UI change snapshot failed; streams start cold")
+            self._poll_task = asyncio.create_task(self._poll_loop(), name="sicim-ui-poll")
 
     async def aclose(self) -> None:
         """Stop listening, drop open connections and — for a server started on
         a bare store — shut the internal runtime down."""
+        if self._unobserve is not None:
+            unobserve, self._unobserve = self._unobserve, None
+            unobserve()
+        poll, self._poll_task = self._poll_task, None
+        if poll is not None:
+            poll.cancel()
+            with contextlib.suppress(BaseException):
+                await poll
+        self._subscribers.clear()
         server, self._server = self._server, None
         if server is not None:
             server.close()
@@ -220,6 +326,9 @@ class UIServer:
                 return  # idle, aborted or garbage connection: nothing to answer
             else:
                 response = await self._dispatch(request)
+            if isinstance(response, StreamResponse):
+                await self._write_stream(reader, writer, response)
+                return
             head = (
                 f"HTTP/1.1 {response.status} {_REASONS.get(response.status, 'OK')}\r\n"
                 f"Content-Type: {response.content_type}\r\n"
@@ -238,7 +347,44 @@ class UIServer:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
-    async def _dispatch(self, request: Request) -> Response:
+    async def _write_stream(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, response: StreamResponse
+    ) -> None:
+        """Write a response that never ends on its own: headers, then chunks
+        until the client goes away or the server shuts the task down.
+
+        A browser that closes the tab sends no request we would read, so the
+        end of the stream is watched for on the socket instead — otherwise an
+        idle stream would hold its subscriber until the next heartbeat write.
+        """
+        pump = asyncio.ensure_future(self._pump(writer, response))
+        closed = asyncio.ensure_future(reader.read(1))  # b"" once the client hangs up
+        try:
+            await asyncio.wait({pump, closed}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            pump.cancel()
+            closed.cancel()
+            await asyncio.gather(pump, closed, return_exceptions=True)
+            with contextlib.suppress(BaseException):
+                await response.chunks.aclose()
+            response.on_close()
+
+    @staticmethod
+    async def _pump(writer: asyncio.StreamWriter, response: StreamResponse) -> None:
+        head = (
+            f"HTTP/1.1 {response.status} {_REASONS.get(response.status, 'OK')}\r\n"
+            f"Content-Type: {response.content_type}\r\n"
+            "Cache-Control: no-store\r\n"
+            "X-Accel-Buffering: no\r\n"  # a proxy in front must not buffer this
+            "Connection: close\r\n\r\n"
+        ).encode("latin-1")
+        writer.write(head)
+        await writer.drain()
+        async for chunk in response.chunks:
+            writer.write(chunk)
+            await writer.drain()
+
+    async def _dispatch(self, request: Request) -> Response | StreamResponse:
         allowed: list[str] = []
         for method, pattern, handler in self._routes:
             match = pattern.fullmatch(request.path)
@@ -283,6 +429,104 @@ class UIServer:
                 "now": time.time(),
             }
         )
+
+    # -- live stream ---------------------------------------------------------
+
+    async def _stream(self, request: Request) -> StreamResponse:
+        """Open a live change stream, optionally narrowed to one run.
+
+        The stream carries notifications, never run data: a client re-fetches
+        whatever it is showing when one arrives, so a missed or coalesced
+        notification can only cost latency, never correctness.
+        """
+        if len(self._subscribers) >= self.max_streams:
+            raise HTTPError(503, f"too many live streams open (limit {self.max_streams})")
+        sub = _Subscriber(queue=asyncio.Queue(maxsize=_STREAM_QUEUE), run_id=request.param("run") or None)
+        self._subscribers.add(sub)
+        return StreamResponse(self._sse(sub), on_close=lambda: self._subscribers.discard(sub))
+
+    async def _sse(self, sub: _Subscriber) -> AsyncIterator[bytes]:
+        yield _sse_data([{"kind": "hello", "run": sub.run_id, "now": time.time(), "version": __version__}])
+        while True:
+            try:
+                batch = [await asyncio.wait_for(sub.queue.get(), self.heartbeat)]
+            except TimeoutError:
+                yield b": keepalive\n\n"  # keep proxies (and idle sockets) from giving up
+                continue
+            while not sub.queue.empty() and len(batch) < _STREAM_QUEUE:
+                batch.append(sub.queue.get_nowait())
+            yield _sse_data(batch)
+
+    def _publish(self, notification: dict[str, Any]) -> None:
+        """Hand a notification to every stream that wants it (never blocks)."""
+        for sub in self._subscribers:
+            if not sub.wants(notification):
+                continue
+            try:
+                sub.queue.put_nowait(notification)
+            except asyncio.QueueFull:
+                sub.dropped += 1  # the client is behind; its next read catches up
+
+    def _on_journal_event(self, run_id: str, event: Event) -> None:
+        """Journal observer: push appends of runs driven in this process."""
+        if not self._subscribers:
+            return
+        self._publish(
+            {"kind": event.kind, "run_id": run_id, "seq": event.seq, "op_id": event.op_id, "ts": event.ts}
+        )
+
+    async def _poll_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.stream_poll_interval)
+            if not self._subscribers:
+                continue  # nobody is watching: no reason to touch the store
+            try:
+                await self._poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "UI change poll failed; retrying in %.1fs", self.stream_poll_interval
+                )
+
+    async def _poll_once(self) -> None:
+        """Notice what *other* processes changed: run status, watched journals
+        and schedules.
+
+        The first pass (at server start) and a run's first sighting only take
+        a snapshot: a client is told about changes from here on, and it has
+        just fetched the state it is showing anyway.
+        """
+        store = self.runtime.store
+        first = self._seen_runs is None
+        runs = {
+            record.run_id: (record.status.value, record.updated_at)
+            for record in await store.list_runs(limit=_POLL_RUNS, newest_first=True)
+        }
+        if not first:
+            for run_id, signature in runs.items():
+                if self._seen_runs.get(run_id) != signature:
+                    self._publish({"kind": "run_changed", "run_id": run_id, "status": signature[0]})
+        self._seen_runs = runs
+
+        watched = {sub.run_id for sub in self._subscribers if sub.run_id}
+        for run_id in watched:
+            seq = await store.latest_event_seq(run_id)
+            known = self._seen_seqs.get(run_id, seq)  # first sight: snapshot, publish nothing
+            self._seen_seqs[run_id] = seq
+            if known != seq:  # a reset rewinds it, so any change counts
+                self._publish({"kind": "journal", "run_id": run_id, "seq": seq})
+        for run_id in list(self._seen_seqs):
+            if run_id not in watched:
+                del self._seen_seqs[run_id]
+
+        schedules = [
+            (s.schedule_id, s.paused, s.next_fire_at, s.last_run_id)
+            for s in await store.list_schedules()
+        ]
+        if self._seen_schedules is not None and schedules != self._seen_schedules:
+            self._publish({"kind": "schedules"})
+        self._seen_schedules = schedules
 
     async def _runs(self, request: Request) -> Response:
         status: RunStatus | None = None
@@ -377,15 +621,30 @@ class UIServer:
         return _json({"ok": True})
 
 
-async def start_ui(target: Runtime | Store, *, host: str = "127.0.0.1", port: int = 8787) -> UIServer:
+async def start_ui(
+    target: Runtime | Store,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    stream_poll_interval: float | None = 1.0,
+) -> UIServer:
     """Serve the monitoring UI for a :class:`Runtime` (cancel/signal/tag go
     through it, in process) or a bare :class:`Store` (a signal-only Runtime
     is created internally). ``port=0`` picks a free port; the server's
-    ``url`` says where it listens. Close it with ``await server.aclose()``."""
+    ``url`` says where it listens. Close it with ``await server.aclose()``.
+
+    The page follows a live stream: journal events of runs this process drives
+    are pushed as they are appended, and changes made by other processes are
+    noticed by a store poll every ``stream_poll_interval`` seconds (None turns
+    that poll off, leaving only in-process pushes)."""
     if isinstance(target, Runtime):
-        server = UIServer(target)
+        server = UIServer(target, stream_poll_interval=stream_poll_interval)
     elif isinstance(target, Store):
-        server = UIServer(Runtime(target, scheduler=False), owns_runtime=True)
+        server = UIServer(
+            Runtime(target, scheduler=False),
+            owns_runtime=True,
+            stream_poll_interval=stream_poll_interval,
+        )
     else:
         raise TypeError(f"start_ui() expects a Runtime or a Store, got {type(target).__name__}")
     await server._listen(host, port)

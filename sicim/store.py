@@ -225,6 +225,17 @@ class Store(abc.ABC):
         appends.
         """
 
+    async def latest_event_seq(self, run_id: str) -> int:
+        """Sequence number of the run's last journaled event, or -1 if it has
+        none — a cheap "did this journal change?" probe for the monitoring UI.
+
+        SQL backends answer it with one aggregate; the default loads the
+        journal, so override it if that is expensive. A reset rewinds the
+        journal, so compare for *inequality*, not growth.
+        """
+        events = await self.load_events(run_id)
+        return events[-1].seq if events else -1
+
     @abc.abstractmethod
     async def append_signal(self, run_id: str, name: str, payload: Any) -> int: ...
 
@@ -895,6 +906,15 @@ class SQLiteStore(Store):
             self._conn.commit()
 
         await self._run(op)
+
+    async def latest_event_seq(self, run_id: str) -> int:
+        def op():
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) AS seq FROM events WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return row["seq"]
+
+        return await self._run(op)
 
     # -- signals -------------------------------------------------------------
 

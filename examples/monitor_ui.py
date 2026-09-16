@@ -8,7 +8,11 @@ izleme arayüzünü bu worker'ın içinde açar. Tarayıcıda deneyin:
   * Runs: durum çipleri, etiket süzgeçleri (bir etikete tıklayın),
   * onay bekleyen run'a "review" sinyali: payload {"approved": true, "by": "siz"},
   * bir run'a etiket ekleyip silmek, journal satırlarına tıklayıp payload'ı açmak,
+  * bir run'ı journal satırındaki ⟲ ile bir op'a geri sarmak (reset),
   * Schedules: nabız zamanlamasını duraklatmak / sürdürmek.
+
+Arayüz bu worker'ın içinde koştuğu için nabız run'larının journal olayları
+canlı akışla (başlıktaki yeşil "live" noktası) anında görünür.
 
 Çalıştır:  .venv/bin/python examples/monitor_ui.py      (Ctrl-C ile durdur)
 """

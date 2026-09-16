@@ -37,6 +37,10 @@ header nav a.active { color: var(--text); }
 header form { margin-left: auto; display: flex; gap: 6px; }
 header label { display: flex; align-items: center; gap: 5px; color: var(--muted); white-space: nowrap; }
 #meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+#live { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+#live::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+#live.on { color: var(--ok); }
+#live.on::before { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-bg); }
 main { padding: 18px 20px 40px; max-width: 1440px; margin: 0 auto; }
 input, select, textarea, button { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
 textarea { font-family: var(--mono); font-size: 12px; width: 100%; min-height: 64px; resize: vertical; }
@@ -109,6 +113,7 @@ form.inline textarea { flex: 1 1 100%; }
   <nav><a href="#/runs" data-nav="runs">Runs</a><a href="#/schedules" data-nav="schedules">Schedules</a></nav>
   <form id="jump"><input type="text" name="id" placeholder="open run id…" size="28"><button>Open</button></form>
   <label><input type="checkbox" id="auto" checked> auto-refresh</label>
+  <span id="live" title="connecting to the live stream…">live</span>
   <button id="refresh" title="refresh now">&#x27F3;</button>
   <span id="meta"></span>
 </header>
@@ -120,6 +125,7 @@ form.inline textarea { flex: 1 1 100%; }
 const app = document.getElementById('app');
 const meta = document.getElementById('meta');
 const auto = document.getElementById('auto');
+const liveEl = document.getElementById('live');
 const toastEl = document.getElementById('toast');
 const STATUSES = ['running', 'completed', 'failed', 'cancelled', 'compensation_failed', 'continued'];
 const state = { view: null, key: null, expanded: new Set(), busy: false };
@@ -545,14 +551,71 @@ document.getElementById('jump').addEventListener('submit', (ev) => {
   const id = new FormData(ev.target).get('id').trim();
   if (id) { ev.target.reset(); go(`#/runs/${enc(id)}`); }
 });
-document.getElementById('refresh').addEventListener('click', () => render(true));
-window.addEventListener('hashchange', () => render(true));
-setInterval(() => {
-  if (!auto.checked || document.hidden || state.busy) return;
+// -- live stream (SSE) -------------------------------------------------------
+// The server only says *what changed*; the page re-fetches whatever it shows.
+// A missed notification therefore costs latency, never correctness — and the
+// slow interval below stays as the safety net when the stream is down.
+const live = { on: false, es: null, run: undefined, pending: null, missed: false, ticks: 0 };
+
+function liveBadge() {
+  liveEl.classList.toggle('on', live.on);
+  liveEl.title = live.on
+    ? 'live: changes arrive over the event stream'
+    : 'polling: the live stream is unavailable';
+}
+
+// Don't redraw over a form the user is typing into, or while a render runs.
+function canAutoRender() {
+  if (!auto.checked || state.busy) return false;
   const a = document.activeElement;
-  if (a && app.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+  return !(a && app.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+}
+
+function scheduleRender() {
+  if (document.hidden) { live.missed = true; return; }   // catch up when visible again
+  if (live.pending) return;                              // coalesce bursts into one redraw
+  live.pending = setTimeout(() => {
+    live.pending = null;
+    if (canAutoRender()) render(true);
+  }, 200);
+}
+
+function connectStream() {
+  const r = parseHash();
+  const want = r.view === 'run' ? r.id : null;
+  if (live.es && live.run === want && live.es.readyState !== EventSource.CLOSED) return;
+  if (live.es) live.es.close();
+  live.run = want;
+  if (!window.EventSource) { liveBadge(); return; }
+  const es = live.es = new EventSource('/api/stream' + (want ? '?run=' + enc(want) : ''));
+  es.onopen = () => { live.on = true; liveBadge(); };
+  es.onmessage = (ev) => {
+    live.on = true;
+    liveBadge();
+    let batch;
+    try { batch = JSON.parse(ev.data); } catch (e) { return; }
+    if (batch.every((m) => m.kind === 'hello')) return;   // the greeting is not a change
+    scheduleRender();
+  };
+  // EventSource reconnects on its own; until it does, the interval carries us.
+  es.onerror = () => { live.on = false; liveBadge(); };
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !live.missed) return;
+  live.missed = false;
+  scheduleRender();
+});
+
+document.getElementById('refresh').addEventListener('click', () => render(true));
+window.addEventListener('hashchange', () => { render(true); connectStream(); });
+setInterval(() => {
+  if (document.hidden || !canAutoRender()) return;
+  if (live.on && ++live.ticks % 5) return;   // live: one slow poll as a backstop
   render(true);
 }, 2000);
+liveBadge();
+connectStream();
 render(true);
 })();
 </script>

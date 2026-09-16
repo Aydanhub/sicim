@@ -267,7 +267,9 @@ python -m sicim --db sicim.db ui                 # http://127.0.0.1:8787
 python -m sicim --pg postgresql://… ui --port 9000
 ```
 
-Sıfır bağımlılıklı, standart kütüphaneyle yazılmış bir web arayüzü: durum sayaçları ve durum/workflow/etiket/ebeveyn süzgeçli run listesi; run ayrıntısı (kayıt, etiketler, girdi/çıktı, kira, çocuklar, sinyaller ve tıklayınca payload'ı açılan journal); zamanlama görünümü. Arayüzden run iptal edilir, sinyal gönderilir, etiket eklenip silinir, run bir op'a geri sarılır (journal satırındaki ⟲ düğmesi ya da başlıktaki *Reset run*) ve zamanlama duraklatılır/silinir; sayfa iki saniyede bir kendini yeniler.
+Sıfır bağımlılıklı, standart kütüphaneyle yazılmış bir web arayüzü: durum sayaçları ve durum/workflow/etiket/ebeveyn süzgeçli run listesi; run ayrıntısı (kayıt, etiketler, girdi/çıktı, kira, çocuklar, sinyaller ve tıklayınca payload'ı açılan journal); zamanlama görünümü. Arayüzden run iptal edilir, sinyal gönderilir, etiket eklenip silinir, run bir op'a geri sarılır (journal satırındaki ⟲ düğmesi ya da başlıktaki *Reset run*) ve zamanlama duraklatılır/silinir.
+
+**Canlı akış.** Sayfa `/api/stream` üzerinden bir SSE kanalı açar ve değişiklik bildirimi geldikçe kendini yeniler; başlıktaki nokta yeşilse akış bağlı demektir. Kanal veri değil, yalnızca *ne değişti* bilgisi taşır (`{"kind": ..., "run_id": ...}`) — istemci neyi gösteriyorsa onu yeniden çeker, böylece kaçan ya da birleştirilen bir bildirim en fazla gecikmeye mal olur. Arayüz bir worker'ın içindeyse o sürecin sürdüğü run'ların journal olayları **anında** iletilir; başka süreçlerin yaptığı değişiklikler `stream_poll_interval` (varsayılan 1 sn) aralıklı bir store taramasıyla görülür. Akış kopar ya da kullanılamazsa sayfa iki saniyelik poll'e geri döner — yani canlı akış bir hızlandırma, bir bağımlılık değil.
 
 Bir worker'ın içine de gömülebilir — o zaman işlemler o worker üzerinden, süreç içinde yürür:
 
@@ -278,7 +280,9 @@ server = await start_ui(rt, port=8787)      # rt yerine çıplak bir store da ve
 await server.aclose()
 ```
 
-Arkasındaki JSON API (`/api/summary`, `/api/runs?status=&workflow=&tag=k=v`, `/api/runs/<id>`, `/api/runs/<id>/cancel|reset|signal|tags`, `/api/schedules`, …) kendi araçlarınızdan da kullanılabilir; yol parçaları yüzde-kodlanır (`#` içeren run id'leri gibi). Kimlik doğrulama **yoktur**: varsayılan olarak yalnız localhost'a bağlanır; dışarı açacaksanız önüne kimlik doğrulayan bir proxy koyun. Kodu yüklü olmayan bir süreçten (`python -m sicim ui`) gönderilen sinyal ve iptal store'a yazılır, run'ı süren worker uygular.
+`start_ui(..., stream_poll_interval=None)` store taramasını kapatır: yalnız bu sürecin sürdüğü run'lar canlı akar. Akışın beslendiği kanca genel amaçlıdır — `rt.add_observer(fn)` her journal append'inde çağrılan bir gözlemci ekler ve aboneliği bırakan bir çağrılabilir döndürür; `on_event` ile birlikte çalışır.
+
+Arkasındaki JSON API (`/api/summary`, `/api/stream[?run=<id>]`, `/api/runs?status=&workflow=&tag=k=v`, `/api/runs/<id>`, `/api/runs/<id>/cancel|reset|signal|tags`, `/api/schedules`, …) kendi araçlarınızdan da kullanılabilir; yol parçaları yüzde-kodlanır (`#` içeren run id'leri gibi). Kimlik doğrulama **yoktur**: varsayılan olarak yalnız localhost'a bağlanır; dışarı açacaksanız önüne kimlik doğrulayan bir proxy koyun. Kodu yüklü olmayan bir süreçten (`python -m sicim ui`) gönderilen sinyal ve iptal store'a yazılır, run'ı süren worker uygular.
 
 ### İptal
 
@@ -356,7 +360,8 @@ Workflow **gövdesi** için (adımlar için değil):
 | `rt.shutdown()` | Çökme-eşdeğeri durdurma (kiraları bırakır) |
 | `await handle` / `handle.result()` | Sonuç, ya da `WorkflowFailed` / `WorkflowCancelled` / `CompensationFailed` / `NonDeterminismError` |
 | `ctx.step / child / sleep / wait_event / now / random / uuid4 / gather / add_compensation / continue_as_new / tag / log / is_replaying / version / tags` | Workflow içi API |
-| `sicim.ui.start_ui(rt_veya_store, host=, port=)` | Web izleme arayüzü → `UIServer` (`url`, `aclose()`) |
+| `rt.add_observer(fn)` | Journal olayı gözlemcisi ekler → aboneliği bırakan çağrılabilir |
+| `sicim.ui.start_ui(rt_veya_store, host=, port=, stream_poll_interval=)` | Web izleme arayüzü → `UIServer` (`url`, `aclose()`) |
 
 Run durumları: `RUNNING → COMPLETED | FAILED | CANCELLED | COMPENSATION_FAILED | CONTINUED`.
 
@@ -387,7 +392,7 @@ python -m sicim --db sicim.db ui --port 8787                   # web izleme aray
 .venv/bin/pytest -q                           # tüm senaryolar üç backend'de de koşar
 ```
 
-## v0.7 kısıtları ve yol haritası
+## v0.8 kısıtları ve yol haritası
 
 - Sinyal, var olmayan run'a gönderilemez (önce `start`).
 - Lease devralma TTL çözünürlüğündedir: ölen worker'ın run'ı en fazla `lease_ttl` sonra devralınır.
@@ -396,10 +401,11 @@ python -m sicim --db sicim.db ui --port 8787                   # web izleme aray
 - Çökme sonrası çocuğu başka süreç devralırsa span'i orijinal trace'e katılamaz; `sicim.parent_run_id` ile korelasyon kalır.
 - Dışarıdan eklenen etiketler (`rt.tag`) workflow gövdesine yansımaz; gövdenin görmesi gereken etiketler `ctx.tag()` ile eklenmelidir.
 - Otomatik devralma (`recover_interval`) varsayılan olarak kapalıdır; her tarama `RUNNING` run'ları listeler, çok büyük store'larda aralığı geniş tutun.
-- İzleme arayüzünde kimlik doğrulama yoktur (yalnız localhost'a bağlayın ya da proxy arkasına alın); sayfa poll ile yenilenir, canlı akış yoktur.
+- İzleme arayüzünde kimlik doğrulama yoktur (yalnız localhost'a bağlayın ya da proxy arkasına alın). Canlı akış SSE'dir: önüne konan proxy `text/event-stream` yanıtlarını tamponlamamalıdır (sunucu `X-Accel-Buffering: no` gönderir). Aynı anda açık akış sayısı sınırlıdır (varsayılan 32; aşılırsa 503) ve yavaş bir istemcinin biriken bildirimleri düşürülür — bildirim yalnız "yeniden çek" dediği için bu doğruluğu bozmaz.
 - Zamanlama çözünürlüğü `schedule_poll_interval`'dır (saniyeli cron için onu da küçültün); DST geçişlerinde var olmayan/yinelenen duvar saatleri bir sonraki geçerli ana kayar. Adlandırılmış saat dilimleri (`tz=`) sistem tz veritabanını (yoksa `tzdata` paketini) ister; UTC için gerekmez.
 - `overlap="skip"` çoklu worker'da en-iyi-çabadır: "önceki run bitti mi" kontrolü ile başlatma arasındaki dar yarışta nadiren bir fazla run başlayabilir. Aynı tick'in iki kez başlaması ise deterministik id sayesinde imkânsızdır.
 - `reset` journal'ı geri sarar, yan etkileri değil: `to_op`'tan önceki adımlar yapılmış sayılır. Telafileri koşmuş bir run'da `force=True` ister ve silinen op'ların çocuk run'larını (ağacıyla) siler.
 - Bir continue-as-new halkası tek başına resetlenemez (ardılını öksüz bırakırdı); zincirin canlı ucunu resetleyin.
 - Özel `Store` uygulamaları: v0.7 ile `replace_events` eklendi ve `mark_signal_consumed` bir `consumed` parametresi aldı (paketle gelen üç backend güncel).
-- Yol haritası: arayüzde canlı akış (SSE) ve run zaman çizelgesi, büyük adım sonuçları için harici blob depolama, workflow sorgu işleyicileri (`ctx.query`), resetlenen run'ın girdilerini/argümanlarını da değiştirebilme.
+- Başka süreçlerin yaptığı değişiklikler arayüze store taramasıyla ulaşır (gecikme `stream_poll_interval`); journal append'leri için PostgreSQL LISTEN/NOTIFY kullanılmaz — her olay için NOTIFY yazmak sıcak yolu pahalılaştırırdı.
+- Yol haritası: arayüzde run zaman çizelgesi, büyük adım sonuçları için harici blob depolama, workflow sorgu işleyicileri (`ctx.query`), resetlenen run'ın girdilerini/argümanlarını da değiştirebilme.

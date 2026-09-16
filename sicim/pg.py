@@ -458,6 +458,15 @@ class PostgresStore(Store):
 
         await self._with_conn(op)
 
+    async def latest_event_seq(self, run_id: str) -> int:
+        async def op(conn):
+            cursor = await conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) AS seq FROM events WHERE run_id = %s", (run_id,)
+            )
+            return (await cursor.fetchone())["seq"]
+
+        return await self._with_conn(op)
+
     # -- signals -------------------------------------------------------------
 
     async def append_signal(self, run_id: str, name: str, payload: Any) -> int:

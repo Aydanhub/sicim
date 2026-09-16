@@ -199,6 +199,8 @@ class Runtime:
 
     ``on_event`` is an observability hook called as ``on_event(run_id, event)``
     after every journal append; exceptions it raises are logged and ignored.
+    Further observers can be attached (and detached) at any time with
+    :meth:`add_observer` — the monitoring UI uses it to stream events live.
     """
 
     def __init__(
@@ -231,6 +233,7 @@ class Runtime:
         self.schedule_poll_interval = schedule_poll_interval
         self.recover_interval = recover_interval
         self.on_event = on_event
+        self._observers: list[Callable[[str, Event], None]] = []
         self._handles: dict[str, RunHandle] = {}
         self._waiters: dict[str, set[asyncio.Future]] = {}
         self._cancel_flags: dict[str, bool] = {}
@@ -518,11 +521,7 @@ class Runtime:
                 "[%s] reset to op %d (%d event(s) dropped, %d child run(s) deleted)",
                 run_id, to_op, len(dropped), len(claimed),
             )
-            if self.on_event is not None:
-                try:
-                    self.on_event(run_id, marker)
-                except Exception:  # noqa: BLE001 - observers must never break a reset
-                    logger.exception("on_event observer raised for run '%s'", run_id)
+            self._dispatch_event(run_id, marker)
         except BaseException:
             for victim in claimed:
                 with contextlib.suppress(Exception):
@@ -600,6 +599,33 @@ class Runtime:
     async def count_runs(self) -> dict[str, int]:
         """Number of runs per status value."""
         return await self.store.count_runs()
+
+    def add_observer(self, observer: Callable[[str, Event], None]) -> Callable[[], None]:
+        """Attach another journal-event observer, returning an unsubscribe callable.
+
+        Called as ``observer(run_id, event)`` after every journal append of
+        every run this worker drives, alongside the constructor's ``on_event``.
+        Observers may come and go while runs are in flight (the monitoring
+        UI attaches one per live stream); exceptions they raise are logged
+        and never reach the run.
+        """
+        self._observers.append(observer)
+
+        def remove() -> None:
+            with contextlib.suppress(ValueError):
+                self._observers.remove(observer)
+
+        return remove
+
+    def _dispatch_event(self, run_id: str, event: Event) -> None:
+        """Fan a journal append out to ``on_event`` and every added observer."""
+        for observer in (self.on_event, *self._observers):
+            if observer is None:
+                continue
+            try:
+                observer(run_id, event)
+            except Exception:  # noqa: BLE001 - observers must never break a run
+                logger.exception("journal observer raised for run '%s'", run_id)
 
     # -- schedules -----------------------------------------------------------
 
@@ -846,7 +872,7 @@ class Runtime:
             await self._ensure_subscribed()
             self._ensure_background()
             events = await self.store.load_events(record.run_id)
-            journal = Journal(record.run_id, self.store, events, on_append=self.on_event)
+            journal = Journal(record.run_id, self.store, events, on_append=self._dispatch_event)
             ctx = WorkflowContext(
                 run_id=record.run_id,
                 workflow_name=record.workflow,
